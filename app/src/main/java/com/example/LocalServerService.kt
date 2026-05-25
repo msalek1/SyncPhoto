@@ -80,7 +80,7 @@ class LocalServerService : Service() {
         val notification = NotificationCompat.Builder(this, "photo_backup_server_channel")
             .setContentTitle("Photo Backup Service Active")
             .setContentText("Local server matching with PIN: $activePin")
-            .setSmallIcon(android.R.drawable.ic_menu_upload)
+            .setSmallIcon(R.drawable.ic_stat_sync)
             .setOngoing(true)
             .build()
 

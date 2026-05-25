@@ -20,7 +20,7 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.*
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -29,7 +29,14 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -963,6 +970,55 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
         _senderPairPin.value = pin
     }
     
+    private val _scheduleEnabled = MutableStateFlow(false)
+    val scheduleEnabled: StateFlow<Boolean> = _scheduleEnabled.asStateFlow()
+
+    private val _scheduleTime = MutableStateFlow("02:00") // Default 2AM
+    val scheduleTime: StateFlow<String> = _scheduleTime.asStateFlow()
+
+    fun setSchedule(enabled: Boolean, time: String) {
+        _scheduleEnabled.value = enabled
+        _scheduleTime.value = time
+        val prefs = appContext.getSharedPreferences("PhotoSyncPrefs", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putBoolean("schedule_enabled", enabled)
+            .putString("schedule_time", time)
+            .apply()
+            
+        val am = appContext.getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
+        val intent = android.content.Intent(appContext, ScheduledBackupReceiver::class.java)
+        val pendingIntent = android.app.PendingIntent.getBroadcast(
+            appContext,
+            1005,
+            intent,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+        
+        if (enabled) {
+            val parts = time.split(":")
+            if (parts.size == 2) {
+                val hour = parts[0].toIntOrNull() ?: 2
+                val min = parts[1].toIntOrNull() ?: 0
+                val calendar = java.util.Calendar.getInstance().apply {
+                    set(java.util.Calendar.HOUR_OF_DAY, hour)
+                    set(java.util.Calendar.MINUTE, min)
+                    set(java.util.Calendar.SECOND, 0)
+                }
+                if (calendar.timeInMillis <= System.currentTimeMillis()) {
+                    calendar.add(java.util.Calendar.DAY_OF_YEAR, 1)
+                }
+                am.setRepeating(
+                    android.app.AlarmManager.RTC_WAKEUP,
+                    calendar.timeInMillis,
+                    android.app.AlarmManager.INTERVAL_DAY,
+                    pendingIntent
+                )
+            }
+        } else {
+            am.cancel(pendingIntent)
+        }
+    }
+
     fun setRememberAutoPair(enabled: Boolean) {
         _rememberAutoPair.value = enabled
         val prefs = appContext.getSharedPreferences("PhotoSyncPrefs", Context.MODE_PRIVATE)
@@ -1162,6 +1218,8 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
         val prefs = appContext.getSharedPreferences("PhotoSyncPrefs", Context.MODE_PRIVATE)
         _autoSyncEnabled.value = prefs.getBoolean("auto_sync_enabled", false)
         _rememberAutoPair.value = prefs.getBoolean("remember_auto_pair", false)
+        _scheduleEnabled.value = prefs.getBoolean("schedule_enabled", false)
+        _scheduleTime.value = prefs.getString("schedule_time", "02:00") ?: "02:00"
     }
 
     private fun getWifiSsid(context: Context): String {
@@ -1366,6 +1424,13 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
     private fun releaseTransferLocks() {
         try { transferWakeLock?.release() } catch(e: Exception){}
         try { transferWifiLock?.release() } catch(e: Exception){}
+        
+        val intent = Intent(appContext, ActiveSyncService::class.java).apply {
+            action = "STOP"
+        }
+        try {
+            appContext.startService(intent) // Triggers STOP branch
+        } catch (e: Exception) {}
     }
 
     fun executeTransfer(onRequireDeletionRequest: (List<Uri>) -> Unit) {
@@ -1387,6 +1452,17 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
             currentFileName = "Performing pairing verification...",
             progress = 0f
         )
+        
+        val intent = Intent(appContext, ActiveSyncService::class.java).apply {
+            action = "START"
+            putExtra("title", "Sending Photos")
+            putExtra("text", "Syncing to ${target.name}")
+        }
+        try {
+            appContext.startService(intent)
+        } catch (e: Exception) {
+            Log.e("ViewModel", "Failed to start ActiveSyncService", e)
+        }
         
         viewModelScope.launch(Dispatchers.IO) {
             val client = OkHttpClient.Builder()
@@ -1762,7 +1838,7 @@ fun PhotoSyncAppScreen(
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
-        containerColor = Color(0xFFF7F9FF),
+        containerColor = MaterialTheme.colorScheme.background,
         snackbarHost = { SnackbarHost(snackbarHostState) }
     ) { innerPadding ->
         Column(
@@ -1783,13 +1859,13 @@ fun PhotoSyncAppScreen(
                     modifier = Modifier
                         .size(40.dp)
                         .clip(RoundedCornerShape(12.dp))
-                        .background(Color(0xFF00639B)),
+                        .background(MaterialTheme.colorScheme.primary),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
                         imageVector = Icons.Default.Share,
                         contentDescription = "PhotoSync Logo",
-                        tint = Color.White,
+                        tint = MaterialTheme.colorScheme.onPrimary,
                         modifier = Modifier.size(20.dp)
                     )
                 }
@@ -1797,16 +1873,40 @@ fun PhotoSyncAppScreen(
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = "PhotoSync",
-                        fontWeight = FontWeight.Medium,
-                        fontSize = 18.sp,
-                        color = Color(0xFF191C1E)
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 20.sp,
+                        color = MaterialTheme.colorScheme.onSurface
                     )
-                    Text(
-                        text = if (serverIp != "No Active Wi-Fi" && serverIp != "No Active IP") "Local Interface Active" else "Disconnected",
-                        fontSize = 11.sp,
-                        color = if (serverIp != "No Active Wi-Fi" && serverIp != "No Active IP") Color(0xFF00639B) else Color(0xFFDC2626),
-                        fontWeight = FontWeight.Normal
-                    )
+                    
+                    val isConnected = serverIp != "No Active Wi-Fi" && serverIp != "No Active IP"
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (isConnected) {
+                            // Pulsing green/blue dot for active local state
+                            val infiniteTransition = rememberInfiniteTransition(label = "pulse_trans")
+                            val pulseAlpha by infiniteTransition.animateFloat(
+                                initialValue = 0.3f,
+                                targetValue = 1.0f,
+                                animationSpec = infiniteRepeatable(
+                                    animation = tween(1100, easing = LinearEasing),
+                                    repeatMode = RepeatMode.Reverse
+                                ),
+                                label = "pulse_alpha"
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(6.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF22C55E).copy(alpha = pulseAlpha))
+                            )
+                            Spacer(modifier = Modifier.width(5.dp))
+                        }
+                        Text(
+                            text = if (isConnected) "Local Interface Active" else "Disconnected",
+                            fontSize = 11.sp,
+                            color = if (isConnected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
                 }
 
                 IconButton(
@@ -1814,12 +1914,12 @@ fun PhotoSyncAppScreen(
                     modifier = Modifier
                         .size(40.dp)
                         .clip(CircleShape)
-                        .background(Color(0xFFDDE2F0).copy(alpha = 0.5f))
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
                 ) {
                     Icon(
                         imageVector = Icons.Default.Refresh,
                         contentDescription = "Refresh Connection",
-                        tint = Color(0xFF191C1E),
+                        tint = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier.size(20.dp)
                     )
                 }
@@ -1843,7 +1943,7 @@ fun PhotoSyncAppScreen(
                     Row(
                         modifier = Modifier
                             .clip(RoundedCornerShape(100.dp))
-                            .background(Color(0xFFD1E4FF))
+                            .background(MaterialTheme.colorScheme.tertiaryContainer)
                             .padding(horizontal = 12.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -1856,7 +1956,7 @@ fun PhotoSyncAppScreen(
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
                             text = "Ready on Local Wi-Fi",
-                            color = Color(0xFF001D36),
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.SemiBold
                         )
@@ -1865,14 +1965,14 @@ fun PhotoSyncAppScreen(
                     Text(
                         text = "Where do you want your photos?",
                         fontWeight = FontWeight.Light,
-                        color = Color(0xFF191C1E),
+                        color = MaterialTheme.colorScheme.onSurface,
                         fontSize = 28.sp,
                         lineHeight = 34.sp
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
                         text = "Transfer backup photos directly between devices with crystal-clear quality over local Wi-Fi. No cloud, no friction.",
-                        color = Color(0xFF43474E),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontSize = 13.sp,
                         lineHeight = 18.sp
                     )
@@ -1920,7 +2020,7 @@ fun PhotoSyncAppScreen(
 
             // Beautiful Clean Minimalism Footer
             Spacer(modifier = Modifier.height(12.dp))
-            HorizontalDivider(color = Color(0xFFDDE2F0), thickness = 1.dp)
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.15f), thickness = 1.dp)
             Spacer(modifier = Modifier.height(12.dp))
             
             Column(
@@ -1938,14 +2038,14 @@ fun PhotoSyncAppScreen(
                         text = "ACTIVE NETWORK",
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF43474E),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         letterSpacing = 0.8.sp
                     )
                     Text(
                         text = if (serverIp != "No Active Wi-Fi" && serverIp != "No Active IP") "Local LAN" else "Disconnected",
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF00639B)
+                        color = MaterialTheme.colorScheme.primary
                     )
                 }
 
@@ -1953,7 +2053,7 @@ fun PhotoSyncAppScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(16.dp))
-                        .background(Color(0xFFF0F4F8))
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
                         .padding(12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -1961,13 +2061,13 @@ fun PhotoSyncAppScreen(
                         modifier = Modifier
                             .size(32.dp)
                             .clip(CircleShape)
-                            .background(Color.White),
+                            .background(MaterialTheme.colorScheme.surface),
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             imageVector = Icons.Default.Lock,
                             contentDescription = "Secure Sync",
-                            tint = Color(0xFF00639B),
+                            tint = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.size(16.dp)
                         )
                     }
@@ -1975,7 +2075,7 @@ fun PhotoSyncAppScreen(
                     Text(
                         text = "Photos are transferred directly between devices. No cloud storage used.",
                         fontSize = 11.sp,
-                        color = Color(0xFF43474E),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontWeight = FontWeight.Normal,
                         lineHeight = 15.sp,
                         modifier = Modifier.weight(1f)
@@ -1998,59 +2098,49 @@ fun RoleSelectionCard(
     val isSender = roleName.contains("Send", ignoreCase = true)
     
     val containerColor = when {
-        isSelected && isSender -> Color(0xFF00639B)
-        isSelected && !isSender -> Color(0xFFDDE2F0)
-        !isSelected && isSender -> Color(0xFF00639B).copy(alpha = 0.08f)
-        else -> Color(0xFFDDE2F0).copy(alpha = 0.4f)
+        isSelected -> if (isSender) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondaryContainer
+        else -> MaterialTheme.colorScheme.surface
     }
     
     val textColor = when {
-        isSelected && isSender -> Color.White
-        isSelected && !isSender -> Color(0xFF191C1E)
-        !isSelected && isSender -> Color(0xFF00639B)
-        else -> Color(0xFF43474E)
+        isSelected -> if (isSender) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer
+        else -> MaterialTheme.colorScheme.onSurface
     }
 
     val descColor = when {
-        isSelected && isSender -> Color.White.copy(alpha = 0.7f)
-        isSelected && !isSender -> Color(0xFF43474E)
-        else -> Color(0xFF43474E).copy(alpha = 0.7f)
+        isSelected -> (if (isSender) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSecondaryContainer).copy(alpha = 0.8f)
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
     
     val iconContainerColor = when {
-        isSelected && isSender -> Color.White.copy(alpha = 0.2f)
-        isSelected && !isSender -> Color(0xFF00639B).copy(alpha = 0.1f)
-        !isSelected && isSender -> Color(0xFF00639B).copy(alpha = 0.15f)
-        else -> Color(0xFF191C1E).copy(alpha = 0.08f)
+        isSelected -> if (isSender) Color.White.copy(alpha = 0.2f) else MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
+        else -> MaterialTheme.colorScheme.surfaceVariant
     }
 
     val iconColor = when {
-        isSelected && isSender -> Color.White
-        isSelected && !isSender -> Color(0xFF00639B)
-        !isSelected && isSender -> Color(0xFF00639B)
-        else -> Color(0xFF191C1E)
+        isSelected -> if (isSender) Color.White else MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
 
     val badgeText = if (isSender) "Main Phone" else "Backup Phone"
     val badgeTextColor = when {
-        isSelected && isSender -> Color.White.copy(alpha = 0.6f)
-        isSelected && !isSender -> Color(0xFF191C1E).copy(alpha = 0.5f)
-        else -> Color(0xFF43474E).copy(alpha = 0.5f)
+        isSelected -> (if (isSender) Color.White else MaterialTheme.colorScheme.onSecondaryContainer).copy(alpha = 0.6f)
+        else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
     }
 
-    val cardShape = RoundedCornerShape(24.dp)
+    val cardShape = RoundedCornerShape(20.dp)
 
     Card(
         modifier = modifier
             .clickable(onClick = onClick)
             .border(
                 width = 1.dp,
-                color = if (isSelected) Color.Transparent else Color(0xFFDDE2F0),
+                color = if (isSelected) Color.Transparent else MaterialTheme.colorScheme.outline.copy(alpha = 0.15f),
                 shape = cardShape
             ),
         shape = cardShape,
         colors = CardDefaults.cardColors(containerColor = containerColor),
-        elevation = CardDefaults.cardElevation(defaultElevation = if (isSelected) 2.dp else 0.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = if (isSelected) 3.dp else 0.dp)
     ) {
         Column(
             modifier = Modifier
@@ -2079,17 +2169,17 @@ fun RoleSelectionCard(
                 Text(
                     text = badgeText,
                     color = badgeTextColor,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold
                 )
             }
             Spacer(modifier = Modifier.height(20.dp))
             Text(
                 text = roleName,
-                fontWeight = FontWeight.Medium,
-                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold,
+                fontSize = 16.sp,
                 color = textColor,
-                lineHeight = 22.sp
+                lineHeight = 20.sp
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
@@ -2107,36 +2197,129 @@ fun OnboardingEmptyFrame() {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(vertical = 32.dp),
+            .padding(vertical = 16.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Box(
+        val primaryColor = MaterialTheme.colorScheme.primary
+        val accentColor = MaterialTheme.colorScheme.primaryContainer
+        val surfaceColor = MaterialTheme.colorScheme.surface
+        
+        Canvas(
             modifier = Modifier
-                .size(80.dp)
-                .clip(CircleShape)
-                .background(Color(0xFFD1E4FF)),
-            contentAlignment = Alignment.Center
+                .size(160.dp)
+                .padding(16.dp)
         ) {
-            Icon(
-                imageVector = Icons.Default.Search,
-                contentDescription = "Search",
-                tint = Color(0xFF00639B),
-                modifier = Modifier.size(36.dp)
+            // Draw left phone
+            drawRoundRect(
+                color = primaryColor,
+                topLeft = Offset(15f, 35f),
+                size = Size(36f, 74f),
+                cornerRadius = CornerRadius(6f, 6f),
+                style = Stroke(width = 3.5.dp.toPx())
+            )
+            // Left phone screen fill
+            drawRoundRect(
+                color = accentColor,
+                topLeft = Offset(21f, 43f),
+                size = Size(24f, 52f),
+                cornerRadius = CornerRadius(3f, 3f)
+            )
+            
+            // Draw right phone
+            drawRoundRect(
+                color = primaryColor,
+                topLeft = Offset(drawContext.size.width - 51f, 60f),
+                size = Size(36f, 74f),
+                cornerRadius = CornerRadius(6f, 6f),
+                style = Stroke(width = 3.5.dp.toPx())
+            )
+            // Right phone screen fill
+            drawRoundRect(
+                color = accentColor,
+                topLeft = Offset(drawContext.size.width - 45f, 68f),
+                size = Size(24f, 52f),
+                cornerRadius = CornerRadius(3f, 3f)
+            )
+            
+            // Connecting curved dashed path
+            val path = Path().apply {
+                moveTo(58f, 70f)
+                quadraticTo(
+                    drawContext.size.width / 2, 10f,
+                    drawContext.size.width - 58f, 95f
+                )
+            }
+            drawPath(
+                path = path,
+                color = primaryColor.copy(alpha = 0.5f),
+                style = Stroke(
+                    width = 2.dp.toPx(),
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(15f, 15f), 0f)
+                )
+            )
+            
+            // Glowing photo in transit in middle
+            val midX = drawContext.size.width / 2
+            val midY = 32f
+            
+            // Draw card shadow
+            drawRoundRect(
+                color = Color.Black.copy(alpha = 0.12f),
+                topLeft = Offset(midX - 16f, midY - 12f),
+                size = Size(32f, 26f),
+                cornerRadius = CornerRadius(6f, 6f)
+            )
+            // Draw photo card background
+            drawRoundRect(
+                color = surfaceColor,
+                topLeft = Offset(midX - 18f, midY - 14f),
+                size = Size(32f, 26f),
+                cornerRadius = CornerRadius(6f, 6f)
+            )
+            // Draw photo card border
+            drawRoundRect(
+                color = primaryColor,
+                topLeft = Offset(midX - 18f, midY - 14f),
+                size = Size(32f, 26f),
+                cornerRadius = CornerRadius(6f, 6f),
+                style = Stroke(width = 1.5.dp.toPx())
+            )
+            
+            // Little mountain drawing inside card
+            val mountainPath = Path().apply {
+                moveTo(midX - 14f, midY + 8f)
+                lineTo(midX - 6f, midY - 1f)
+                lineTo(midX, midY + 4f)
+                lineTo(midX + 6f, midY - 4f)
+                lineTo(midX + 12f, midY + 8f)
+                close()
+            }
+            drawPath(
+                path = mountainPath,
+                color = primaryColor.copy(alpha = 0.35f)
+            )
+            
+            // Little sun circle inside card
+            drawCircle(
+                color = Color(0xFFFFB900),
+                radius = 3f,
+                center = Offset(midX - 8f, midY - 4f)
             )
         }
-        Spacer(modifier = Modifier.height(16.dp))
+        
+        Spacer(modifier = Modifier.height(12.dp))
         Text(
             text = "Select an option above to start syncing",
-            color = Color(0xFF191C1E),
-            fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.onSurface,
+            fontWeight = FontWeight.Bold,
             fontSize = 15.sp,
             textAlign = TextAlign.Center
         )
         Spacer(modifier = Modifier.height(4.dp))
         Text(
             text = "Photos are backed up directly over local network. Safe, secure, and private.",
-            color = Color(0xFF43474E),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontSize = 12.sp,
             textAlign = TextAlign.Center,
             modifier = Modifier.padding(horizontal = 32.dp)
@@ -2167,6 +2350,8 @@ fun SenderFlowFrame(
     val selectedFolderIds by viewModel.selectedFolderIds.collectAsStateWithLifecycle()
     val isScanningFolders by viewModel.isScanningFolders.collectAsStateWithLifecycle()
     val autoSyncEnabled by viewModel.autoSyncEnabled.collectAsStateWithLifecycle()
+    val scheduleEnabled by viewModel.scheduleEnabled.collectAsStateWithLifecycle()
+    val scheduleTime by viewModel.scheduleTime.collectAsStateWithLifecycle()
     var selectionMode by remember { mutableStateOf(0) } // 0 = Photo Picker, 1 = Backup Folders
     
     // Android Visual Photo Picker launcher
@@ -2189,8 +2374,8 @@ fun SenderFlowFrame(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(16.dp))
-                    .background(Color.White)
-                    .border(1.dp, Color(0xFFDDE2F0), RoundedCornerShape(16.dp))
+                    .background(MaterialTheme.colorScheme.surface)
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.15f), RoundedCornerShape(16.dp))
                     .padding(16.dp)
             ) {
                 Row(
@@ -2202,18 +2387,18 @@ fun SenderFlowFrame(
                         text = "1. TARGET BACKUP DEVICE",
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF00639B),
+                        color = MaterialTheme.colorScheme.primary,
                         letterSpacing = 0.5.sp
                     )
                     Card(
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFFD1E4FF)),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
                         shape = RoundedCornerShape(8.dp)
                     ) {
                         Text(
                             text = "mDNS SCAN",
                             fontSize = 8.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color(0xFF001D36),
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                         )
                     }
@@ -2231,21 +2416,21 @@ fun SenderFlowFrame(
                     ) {
                         CircularProgressIndicator(
                             modifier = Modifier.size(16.dp),
-                            color = Color(0xFF00639B),
+                            color = MaterialTheme.colorScheme.primary,
                             strokeWidth = 2.dp
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = "Scanning Wi-Fi sub-network...",
                             fontSize = 11.sp,
-                            color = Color(0xFF43474E)
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 } else {
                     devices.values.forEach { device ->
                         val isPicked = selectedDevice?.name == device.name
-                        val rowBgColor = if (isPicked) Color(0xFFD1E4FF).copy(alpha = 0.6f) else Color.Transparent
-                        val rowBorderColor = if (isPicked) Color(0xFF00639B) else Color(0xFFDDE2F0)
+                        val rowBgColor = if (isPicked) MaterialTheme.colorScheme.primary.copy(alpha = 0.1f) else Color.Transparent
+                        val rowBorderColor = if (isPicked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.15f)
                         
                         Row(
                             modifier = Modifier
@@ -2261,7 +2446,7 @@ fun SenderFlowFrame(
                             Icon(
                                 imageVector = if (isPicked) Icons.Default.CheckCircle else Icons.Default.Home,
                                 contentDescription = null,
-                                tint = if (isPicked) Color(0xFF00639B) else Color(0xFF43474E),
+                                tint = if (isPicked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(20.dp)
                             )
                             Spacer(modifier = Modifier.width(10.dp))
@@ -2270,24 +2455,24 @@ fun SenderFlowFrame(
                                     text = device.name,
                                     fontSize = 13.sp,
                                     fontWeight = FontWeight.Bold,
-                                    color = Color(0xFF191C1E)
+                                    color = MaterialTheme.colorScheme.onSurface
                                 )
                                 Text(
                                     text = "IP: ${device.ip}:${device.port}",
                                     fontSize = 10.sp,
-                                    color = Color(0xFF43474E)
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                             if (isPicked) {
                                 Card(
-                                    colors = CardDefaults.cardColors(containerColor = Color(0xFF00639B)),
+                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary),
                                     shape = RoundedCornerShape(8.dp)
                                 ) {
                                     Text(
                                         text = "SELECTED",
                                         fontWeight = FontWeight.SemiBold,
                                         fontSize = 8.sp,
-                                        color = Color.White,
+                                        color = MaterialTheme.colorScheme.onPrimary,
                                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                                     )
                                 }
@@ -2306,22 +2491,22 @@ fun SenderFlowFrame(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(16.dp))
-                        .background(Color.White)
-                        .border(1.dp, Color(0xFFDDE2F0), RoundedCornerShape(16.dp))
+                        .background(MaterialTheme.colorScheme.surface)
+                        .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.15f), RoundedCornerShape(16.dp))
                         .padding(16.dp)
                 ) {
                     Text(
                         text = "1.5 ENTER SECURITY PAIRING PIN",
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF00639B),
+                        color = MaterialTheme.colorScheme.primary,
                         letterSpacing = 0.5.sp
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
                         text = "Input the one-time 4-digit pairing code shown on your receiver device to register and authorize the photo synchronization session.",
                         fontSize = 11.sp,
-                        color = Color(0xFF43474E),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         lineHeight = 16.sp
                     )
                     Spacer(modifier = Modifier.height(12.dp))
@@ -2336,9 +2521,11 @@ fun SenderFlowFrame(
                         placeholder = { Text("e.g. 5832", fontSize = 12.sp) },
                         singleLine = true,
                         colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Color(0xFF00639B),
-                            unfocusedBorderColor = Color(0xFFDDE2F0),
-                            cursorColor = Color(0xFF00639B)
+                            focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                            unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                            unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
+                            cursorColor = MaterialTheme.colorScheme.primary
                         ),
                         modifier = Modifier
                             .fillMaxWidth()
@@ -2365,12 +2552,16 @@ fun SenderFlowFrame(
                     ) {
                         Checkbox(
                             checked = rememberAutoPair,
-                            onCheckedChange = { chk -> viewModel.setRememberAutoPair(chk) }
+                            onCheckedChange = { chk -> viewModel.setRememberAutoPair(chk) },
+                            colors = CheckboxDefaults.colors(
+                                checkedColor = MaterialTheme.colorScheme.primary,
+                                uncheckedColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                            )
                         )
                         Text(
                             text = "Auto-pair with this device on this Wi-Fi network",
                             fontSize = 12.sp,
-                            color = Color(0xFF43474E)
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
@@ -2383,15 +2574,15 @@ fun SenderFlowFrame(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(16.dp))
-                    .background(Color.White)
-                    .border(1.dp, Color(0xFFDDE2F0), RoundedCornerShape(16.dp))
+                    .background(MaterialTheme.colorScheme.surface)
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.15f), RoundedCornerShape(16.dp))
                     .padding(16.dp)
             ) {
                 Text(
                     text = "2. CHOOSE SOURCE PHOTOS",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
-                    color = Color(0xFF00639B),
+                    color = MaterialTheme.colorScheme.primary,
                     letterSpacing = 0.5.sp,
                     modifier = Modifier.padding(bottom = 12.dp)
                 )
@@ -2399,20 +2590,20 @@ fun SenderFlowFrame(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Color(0xFFF0F4F8))
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
                         .padding(4.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    val activeColor = Color(0xFF00639B)
+                    val activeColor = MaterialTheme.colorScheme.primary
                     val inactiveColor = Color.Transparent
                     
                     Box(
                         modifier = Modifier
                             .weight(1f)
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(if (selectionMode == 0) Color.White else inactiveColor)
-                            .border(1.dp, if (selectionMode == 0) Color(0xFF191C1E).copy(alpha = 0.1f) else Color.Transparent, RoundedCornerShape(6.dp))
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (selectionMode == 0) MaterialTheme.colorScheme.surface else inactiveColor)
+                            .border(1.dp, if (selectionMode == 0) MaterialTheme.colorScheme.outline.copy(alpha = 0.1f) else Color.Transparent, RoundedCornerShape(8.dp))
                             .clickable { selectionMode = 0 }
                             .padding(vertical = 8.dp),
                         contentAlignment = Alignment.Center
@@ -2421,7 +2612,7 @@ fun SenderFlowFrame(
                             Icon(
                                 imageVector = Icons.Default.Add,
                                 contentDescription = null,
-                                tint = if (selectionMode == 0) activeColor else Color(0xFF43474E),
+                                tint = if (selectionMode == 0) activeColor else MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(16.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
@@ -2429,7 +2620,7 @@ fun SenderFlowFrame(
                                 text = "Photo Picker",
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold,
-                                color = if (selectionMode == 0) activeColor else Color(0xFF43474E)
+                                color = if (selectionMode == 0) activeColor else MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
@@ -2437,9 +2628,9 @@ fun SenderFlowFrame(
                     Box(
                         modifier = Modifier
                             .weight(1f)
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(if (selectionMode == 1) Color.White else inactiveColor)
-                            .border(1.dp, if (selectionMode == 1) Color(0xFF191C1E).copy(alpha = 0.1f) else Color.Transparent, RoundedCornerShape(6.dp))
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (selectionMode == 1) MaterialTheme.colorScheme.surface else inactiveColor)
+                            .border(1.dp, if (selectionMode == 1) MaterialTheme.colorScheme.outline.copy(alpha = 0.1f) else Color.Transparent, RoundedCornerShape(8.dp))
                             .clickable { 
                                 selectionMode = 1
                                 viewModel.checkAndLoadFolders()
@@ -2451,7 +2642,7 @@ fun SenderFlowFrame(
                             Icon(
                                 imageVector = Icons.Default.List,
                                 contentDescription = null,
-                                tint = if (selectionMode == 1) activeColor else Color(0xFF43474E),
+                                tint = if (selectionMode == 1) activeColor else MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(16.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
@@ -2459,7 +2650,7 @@ fun SenderFlowFrame(
                                 text = "Backup Folders",
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold,
-                                color = if (selectionMode == 1) activeColor else Color(0xFF43474E)
+                                color = if (selectionMode == 1) activeColor else MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
@@ -2479,12 +2670,12 @@ fun SenderFlowFrame(
                             .height(48.dp)
                             .testTag("action_select_photos"),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFFDDE2F0),
-                            contentColor = Color(0xFF191C1E)
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                            contentColor = MaterialTheme.colorScheme.onSurfaceVariant
                         ),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Icon(imageVector = Icons.Default.Add, contentDescription = null, tint = Color(0xFF191C1E))
+                        Icon(imageVector = Icons.Default.Add, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = "Access Photo Picker",
@@ -2521,7 +2712,7 @@ fun SenderFlowFrame(
                                 text = "Permit storage access to auto-discover local media folders.",
                                 fontSize = 12.sp,
                                 textAlign = TextAlign.Center,
-                                color = Color(0xFF43474E),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(bottom = 8.dp)
                             )
                             Button(
@@ -2533,7 +2724,7 @@ fun SenderFlowFrame(
                                     }
                                     permissionLauncher.launch(perm)
                                 },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00639B)),
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                                 shape = RoundedCornerShape(8.dp)
                             ) {
                                 Text("Grant Permission", fontSize = 12.sp)
@@ -2549,11 +2740,11 @@ fun SenderFlowFrame(
                         ) {
                             CircularProgressIndicator(
                                 modifier = Modifier.size(20.dp),
-                                color = Color(0xFF00639B),
+                                color = MaterialTheme.colorScheme.primary,
                                 strokeWidth = 2.dp
                             )
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Scanning memory...", fontSize = 12.sp, color = Color(0xFF43474E))
+                            Text("Scanning memory...", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     } else if (availableFolders.isEmpty()) {
                         Box(
@@ -2565,7 +2756,7 @@ fun SenderFlowFrame(
                             Text(
                                 text = "No folder structures containing images identified.",
                                 fontSize = 12.sp,
-                                color = Color.Gray
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                             )
                         }
                     } else {
@@ -2576,7 +2767,7 @@ fun SenderFlowFrame(
                             Text(
                                 text = "Tick folders to automatically add their content to the backup queue:",
                                 fontSize = 11.sp,
-                                color = Color(0xFF43474E),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(bottom = 4.dp)
                             )
                             
@@ -2586,8 +2777,8 @@ fun SenderFlowFrame(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clip(RoundedCornerShape(10.dp))
-                                        .background(if (isChecked) Color(0xFFD1E4FF).copy(alpha = 0.3f) else Color(0xFFF7F9FF))
-                                        .border(1.dp, if (isChecked) Color(0xFF00639B) else Color(0xFFDDE2F0), RoundedCornerShape(10.dp))
+                                        .background(if (isChecked) MaterialTheme.colorScheme.primary.copy(alpha = 0.1f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.2f))
+                                        .border(1.dp, if (isChecked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline.copy(alpha = 0.15f), RoundedCornerShape(10.dp))
                                         .clickable { viewModel.toggleFolderSelection(folder.id) }
                                         .padding(8.dp),
                                     verticalAlignment = Alignment.CenterVertically
@@ -2596,7 +2787,7 @@ fun SenderFlowFrame(
                                         modifier = Modifier
                                             .size(42.dp)
                                             .clip(RoundedCornerShape(8.dp))
-                                            .background(Color(0xFFE0E5F1)),
+                                            .background(MaterialTheme.colorScheme.surfaceVariant),
                                         contentAlignment = Alignment.Center
                                     ) {
                                         if (folder.firstPhotoUri != null) {
@@ -2610,7 +2801,7 @@ fun SenderFlowFrame(
                                             Icon(
                                                 imageVector = Icons.Default.List,
                                                 contentDescription = null,
-                                                tint = Color(0xFF00639B),
+                                                tint = MaterialTheme.colorScheme.primary,
                                                 modifier = Modifier.size(20.dp)
                                             )
                                         }
@@ -2623,12 +2814,12 @@ fun SenderFlowFrame(
                                             text = folder.name,
                                             fontSize = 13.sp,
                                             fontWeight = FontWeight.Bold,
-                                            color = Color(0xFF191C1E)
+                                            color = MaterialTheme.colorScheme.onSurface
                                         )
                                         Text(
                                             text = "${folder.count} items inside",
                                             fontSize = 11.sp,
-                                            color = Color(0xFF43474E)
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
                                         )
                                     }
                                     
@@ -2636,7 +2827,8 @@ fun SenderFlowFrame(
                                         checked = isChecked,
                                         onCheckedChange = { viewModel.toggleFolderSelection(folder.id) },
                                         colors = CheckboxDefaults.colors(
-                                            checkedColor = Color(0xFF00639B)
+                                            checkedColor = MaterialTheme.colorScheme.primary,
+                                            uncheckedColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                                         )
                                     )
                                 }
@@ -2658,12 +2850,12 @@ fun SenderFlowFrame(
                             text = "${selectedPhotos.size} Photos Chosen",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color(0xFF191C1E)
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
                             text = "Size: $representationStr",
                             fontSize = 11.sp,
-                            color = Color(0xFF00639B)
+                            color = MaterialTheme.colorScheme.primary
                         )
                     }
                     Spacer(modifier = Modifier.height(8.dp))
@@ -2677,7 +2869,7 @@ fun SenderFlowFrame(
                                     .size(64.dp)
                                     .clip(RoundedCornerShape(8.dp))
                                     .background(Color.Black)
-                                    .border(1.dp, Color(0xFFDDE2F0), RoundedCornerShape(8.dp))
+                                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.2f), RoundedCornerShape(8.dp))
                             ) {
                                 AsyncImage(
                                     model = photo.uri,
@@ -2694,9 +2886,9 @@ fun SenderFlowFrame(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.Center
                     ) {
-                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color(0xFF00639B))
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = MaterialTheme.colorScheme.primary)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text(text = "Preparing media files...", fontSize = 11.sp, color = Color(0xFF43474E))
+                        Text(text = "Preparing media files...", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
@@ -2708,15 +2900,15 @@ fun SenderFlowFrame(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(16.dp))
-                    .background(Color.White)
-                    .border(1.dp, Color(0xFFDDE2F0), RoundedCornerShape(16.dp))
+                    .background(MaterialTheme.colorScheme.surface)
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.15f), RoundedCornerShape(16.dp))
                     .padding(16.dp)
             ) {
                 Text(
                     text = "3. POST-TRANSFER ACTION",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
-                    color = Color(0xFF00639B),
+                    color = MaterialTheme.colorScheme.primary,
                     letterSpacing = 0.5.sp,
                     modifier = Modifier.padding(bottom = 12.dp)
                 )
@@ -2733,7 +2925,7 @@ fun SenderFlowFrame(
                     RadioButton(
                         selected = deletionOption == DeletionOption.KEEP,
                         onClick = { viewModel.setDeletionOption(DeletionOption.KEEP) },
-                        colors = RadioButtonDefaults.colors(selectedColor = Color(0xFF00639B))
+                        colors = RadioButtonDefaults.colors(selectedColor = MaterialTheme.colorScheme.primary)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Column {
@@ -2741,12 +2933,12 @@ fun SenderFlowFrame(
                             text = "Preserve raw photos here",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color(0xFF191C1E)
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
                             text = "Keep image copies safe on both devices.",
                             fontSize = 10.sp,
-                            color = Color(0xFF43474E)
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
@@ -2765,7 +2957,7 @@ fun SenderFlowFrame(
                     RadioButton(
                         selected = deletionOption == DeletionOption.DELETE,
                         onClick = { viewModel.setDeletionOption(DeletionOption.DELETE) },
-                        colors = RadioButtonDefaults.colors(selectedColor = Color(0xFF00639B))
+                        colors = RadioButtonDefaults.colors(selectedColor = MaterialTheme.colorScheme.primary)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Column {
@@ -2773,12 +2965,12 @@ fun SenderFlowFrame(
                             text = "Delete photos after successful transfer",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color(0xFF191C1E)
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
                             text = "Automated post-sync cleanup. Safeguards space.",
                             fontSize = 10.sp,
-                            color = Color(0xFF43474E)
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
@@ -2789,21 +2981,21 @@ fun SenderFlowFrame(
                             .fillMaxWidth()
                             .padding(top = 10.dp)
                             .clip(RoundedCornerShape(12.dp))
-                            .background(Color(0xFFFFB900).copy(alpha = 0.1f))
-                            .border(1.dp, Color(0xFFFFB900).copy(alpha = 0.25f), RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.2f))
+                            .border(1.dp, MaterialTheme.colorScheme.tertiary.copy(alpha = 0.25f), RoundedCornerShape(12.dp))
                             .padding(10.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.Warning,
                             contentDescription = null,
-                            tint = Color(0xFFD97706),
+                            tint = MaterialTheme.colorScheme.tertiary,
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = "Android OS will launch a secure permission confirmation dialog at the end of the backup before wiping files from this device.",
                             fontSize = 9.sp,
-                            color = Color(0xFF975A16),
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
                             lineHeight = 13.sp
                         )
                     }
@@ -2818,8 +3010,8 @@ fun SenderFlowFrame(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(16.dp))
-                        .background(Color.White)
-                        .border(1.dp, Color(0xFFDDE2F0), RoundedCornerShape(16.dp))
+                        .background(MaterialTheme.colorScheme.surface)
+                        .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.15f), RoundedCornerShape(16.dp))
                         .padding(16.dp)
                 ) {
                     when (val state = syncState) {
@@ -2828,7 +3020,7 @@ fun SenderFlowFrame(
                                 text = "TRANSFER IN PROGRESS",
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
-                                color = Color(0xFF00639B),
+                                color = MaterialTheme.colorScheme.primary,
                                 letterSpacing = 0.5.sp
                             )
                             Spacer(modifier = Modifier.height(4.dp))
@@ -2836,13 +3028,13 @@ fun SenderFlowFrame(
                                 text = "Syncing photo ${state.currentIndex + 1} of ${state.totalCount}",
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.Bold,
-                                color = Color(0xFF191C1E)
+                                color = MaterialTheme.colorScheme.onSurface
                                 )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = state.currentFileName,
                                 fontSize = 10.sp,
-                                color = Color(0xFF43474E),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
@@ -2854,8 +3046,8 @@ fun SenderFlowFrame(
                                     .fillMaxWidth()
                                     .height(6.dp)
                                     .clip(RoundedCornerShape(3.dp)),
-                                color = Color(0xFF00639B),
-                                trackColor = Color(0xFFDDE2F0),
+                                color = MaterialTheme.colorScheme.primary,
+                                trackColor = MaterialTheme.colorScheme.surfaceVariant,
                             )
                         }
                         
@@ -2865,12 +3057,12 @@ fun SenderFlowFrame(
                                 horizontalArrangement = Arrangement.Center,
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)
                             ) {
-                                CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color(0xFF00639B))
+                                CircularProgressIndicator(modifier = Modifier.size(20.dp), color = MaterialTheme.colorScheme.primary)
                                 Spacer(modifier = Modifier.width(10.dp))
                                 Text(
                                     text = "Launching Android Media Store Cleanup Request...",
                                     fontSize = 12.sp,
-                                    color = Color(0xFF191C1E),
+                                    color = MaterialTheme.colorScheme.onSurface,
                                     fontWeight = FontWeight.Medium
                                 )
                             }
@@ -2890,18 +3082,18 @@ fun SenderFlowFrame(
                                         text = if (state.partialError != null) "Partial Sync Complete" else "Sync Handshake Complete!",
                                         fontSize = 13.sp,
                                         fontWeight = FontWeight.Bold,
-                                        color = Color(0xFF191C1E)
+                                        color = MaterialTheme.colorScheme.onSurface
                                     )
                                     Text(
                                         text = "${state.transferredCount} items successfully backed up securely.",
                                         fontSize = 11.sp,
-                                        color = Color(0xFF43474E)
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                     if (state.partialError != null) {
                                         Text(
                                             text = "Error: ${state.partialError}",
                                             fontSize = 9.sp,
-                                            color = Color(0xFFBA1A1A)
+                                            color = MaterialTheme.colorScheme.error
                                         )
                                     }
                                 }
@@ -2913,15 +3105,15 @@ fun SenderFlowFrame(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clip(RoundedCornerShape(12.dp))
-                                        .background(Color(0xFF00639B).copy(alpha = 0.04f))
-                                        .border(1.dp, Color(0xFFDDE2F0), RoundedCornerShape(12.dp))
+                                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.04f))
+                                        .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.15f), RoundedCornerShape(12.dp))
                                         .padding(12.dp)
                                 ) {
                                     Text(
                                         text = "REVIEW TRANSFERRED FILES",
                                         fontSize = 10.sp,
                                         fontWeight = FontWeight.Bold,
-                                        color = Color(0xFF00639B),
+                                        color = MaterialTheme.colorScheme.primary,
                                         letterSpacing = 0.5.sp
                                     )
                                     Spacer(modifier = Modifier.height(8.dp))
@@ -2950,7 +3142,7 @@ fun SenderFlowFrame(
                                     Text(
                                         text = "Would you like to delete these successfully backed up copies from this local device to free up storage space?",
                                         fontSize = 11.sp,
-                                        color = Color(0xFF191C1E),
+                                        color = MaterialTheme.colorScheme.onSurface,
                                         lineHeight = 15.sp
                                     )
                                     
@@ -2965,8 +3157,8 @@ fun SenderFlowFrame(
                                                 viewModel.initiateDeferredDeletion(state.transferredUris, onTriggerDeletions)
                                             },
                                             colors = ButtonDefaults.buttonColors(
-                                                containerColor = Color(0xFFBA1A1A),
-                                                contentColor = Color.White
+                                                containerColor = MaterialTheme.colorScheme.error,
+                                                contentColor = MaterialTheme.colorScheme.onError
                                             ),
                                             shape = RoundedCornerShape(10.dp),
                                             modifier = Modifier.weight(1f)
@@ -2982,11 +3174,11 @@ fun SenderFlowFrame(
                                             onClick = {
                                                 viewModel.clearSelections()
                                             },
-                                            border = BorderStroke(1.dp, Color(0xFFDDE2F0)),
+                                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)),
                                             shape = RoundedCornerShape(10.dp),
                                             modifier = Modifier.weight(1f)
                                         ) {
-                                            Text("Keep Local Only", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF43474E))
+                                            Text("Keep Local Only", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                         }
                                     }
                                 }
@@ -2994,7 +3186,7 @@ fun SenderFlowFrame(
                                 Spacer(modifier = Modifier.height(12.dp))
                                 Button(
                                     onClick = { viewModel.clearSelections() },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDDE2F0), contentColor = Color(0xFF191C1E)),
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant, contentColor = MaterialTheme.colorScheme.onSurfaceVariant),
                                     modifier = Modifier.fillMaxWidth(),
                                     shape = RoundedCornerShape(10.dp)
                                 ) {
@@ -3008,7 +3200,7 @@ fun SenderFlowFrame(
                                 Icon(
                                     imageVector = Icons.Default.Close,
                                     contentDescription = null,
-                                    tint = Color(0xFFDC2626),
+                                    tint = MaterialTheme.colorScheme.error,
                                     modifier = Modifier.size(24.dp)
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
@@ -3017,22 +3209,22 @@ fun SenderFlowFrame(
                                         text = "Sync Failed",
                                         fontSize = 13.sp,
                                         fontWeight = FontWeight.Bold,
-                                        color = Color(0xFF191C1E)
+                                        color = MaterialTheme.colorScheme.onSurface
                                     )
                                     Text(
                                         text = state.error,
                                         fontSize = 10.sp,
-                                        color = Color(0xFFDC2626)
+                                        color = MaterialTheme.colorScheme.error
                                     )
                                 }
                             }
                             Spacer(modifier = Modifier.height(10.dp))
                             Button(
                                 onClick = { viewModel.clearSelections() },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDDE2F0), contentColor = Color(0xFF191C1E)),
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant, contentColor = MaterialTheme.colorScheme.onSurfaceVariant),
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(10.dp)
-                            ) {
+                             ) {
                                 Text(text = "Reset Sync Tool", fontSize = 11.sp, fontWeight = FontWeight.Medium)
                             }
                         }
@@ -3061,12 +3253,12 @@ fun SenderFlowFrame(
                             text = "Auto-Sync New Photos",
                             fontWeight = FontWeight.Bold,
                             fontSize = 14.sp,
-                            color = Color(0xFF191C1E)
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
                             text = "Automatically backup new photos added to this phone.",
                             fontSize = 11.sp,
-                            color = Color(0xFF43474E),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                             lineHeight = 14.sp
                         )
                     }
@@ -3078,9 +3270,69 @@ fun SenderFlowFrame(
                             }
                         },
                         colors = SwitchDefaults.colors(
-                            checkedThumbColor = Color.White,
-                            checkedTrackColor = Color(0xFF00639B),
-                            checkedBorderColor = Color.Transparent
+                            checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
+                            checkedTrackColor = MaterialTheme.colorScheme.primary,
+                            uncheckedThumbColor = MaterialTheme.colorScheme.outline,
+                            uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
+                        )
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Schedule Backup Option
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                        .padding(16.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Schedule Daily Backup",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "Backs up new photos at $scheduleTime daily.",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            lineHeight = 14.sp
+                        )
+                        
+                        if (scheduleEnabled) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "Tap here to change time",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.clickable {
+                                    selectionMode = 3 // We can use selectionMode or a boolean. Let's just avoid inline var and put a dialog variable.
+                                }
+                            )
+                        }
+                    }
+                    Switch(
+                        checked = scheduleEnabled,
+                        onCheckedChange = { isChecked ->
+                            if (isChecked) {
+                                if (selectedDevice != null && senderPin.length == 4) {
+                                    selectionMode = 3
+                                }
+                            } else {
+                                viewModel.setSchedule(false, scheduleTime)
+                            }
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
+                            checkedTrackColor = MaterialTheme.colorScheme.primary,
+                            uncheckedThumbColor = MaterialTheme.colorScheme.outline,
+                            uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
                         )
                     )
                 }
@@ -3093,36 +3345,90 @@ fun SenderFlowFrame(
                         .fillMaxWidth()
                         .height(52.dp)
                         .testTag("action_start_sync"),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFF00639B),
-                    disabledContainerColor = Color(0xFFDDE2F0).copy(alpha = 0.6f),
-                    contentColor = Color.White,
-                    disabledContentColor = Color(0xFF191C1E).copy(alpha = 0.35f)
-                ),
-                shape = RoundedCornerShape(14.dp),
-                enabled = canLaunch
-            ) {
-                Icon(
-                    imageVector = Icons.Default.PlayArrow,
-                    contentDescription = null,
-                    tint = if (canLaunch) Color.White else Color(0xFF191C1E).copy(alpha = 0.35f)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                val desc = if (selectedDevice == null) "Select Backup Device first" 
-                           else if (senderPin.length < 4) "Enter 4-digit Pairing PIN"
-                           else if (selectedPhotos.isEmpty()) "Select photos to backup"
-                           else "Start Photo Sync"
-                Text(
-                    text = desc,
-                    fontWeight = FontWeight.ExtraBold,
-                    fontSize = 14.sp
-                )
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        disabledContainerColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                        disabledContentColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                    ),
+                    shape = RoundedCornerShape(14.dp),
+                    enabled = canLaunch
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = null,
+                        tint = if (canLaunch) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    val desc = if (selectedDevice == null) "Select Backup Device first" 
+                               else if (senderPin.length < 4) "Enter 4-digit Pairing PIN"
+                               else if (selectedPhotos.isEmpty()) "Select photos to backup"
+                               else "Start Photo Sync"
+                    Text(
+                        text = desc,
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 14.sp
+                    )
+                }
             }
-            }
-            Spacer(modifier = Modifier.height(16.dp))
         }
     }
+
+    if (selectionMode == 3) {
+        var tempHour by remember { mutableStateOf(scheduleTime.split(":").getOrNull(0) ?: "02") }
+        var tempMin by remember { mutableStateOf(scheduleTime.split(":").getOrNull(1) ?: "00") }
+        
+        AlertDialog(
+            onDismissRequest = {
+                selectionMode = 0
+                viewModel.setSchedule(false, scheduleTime)
+            },
+            title = { Text("Set Backup Time") },
+            text = {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = tempHour,
+                        onValueChange = { if (it.length <= 2) tempHour = it },
+                        label = { Text("HH") },
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(":", fontWeight = FontWeight.Bold)
+                    OutlinedTextField(
+                        value = tempMin,
+                        onValueChange = { if (it.length <= 2) tempMin = it },
+                        label = { Text("MM") },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val h = tempHour.toIntOrNull() ?: 2
+                    val m = tempMin.toIntOrNull() ?: 0
+                    val formattedTime = String.format("%02d:%02d", h.coerceIn(0, 23), m.coerceIn(0, 59))
+                    viewModel.setSchedule(true, formattedTime)
+                    selectionMode = 0
+                }) {
+                    Text("Save")
+                }
+            },
+            dismissButton = {
+                Button(onClick = {
+                    selectionMode = 0
+                    viewModel.setSchedule(false, scheduleTime)
+                }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant, contentColor = MaterialTheme.colorScheme.onSurfaceVariant)) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 }
+
+
 
 // ==========================================
 // RECEIVER FLOW COMPOSE VIEW
@@ -3150,8 +3456,8 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(16.dp))
-                    .background(Color.White)
-                    .border(1.dp, Color(0xFFDDE2F0), RoundedCornerShape(16.dp))
+                    .background(MaterialTheme.colorScheme.surface)
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.15f), RoundedCornerShape(16.dp))
                     .padding(16.dp)
             ) {
                 Row(
@@ -3163,21 +3469,21 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                         text = "BACKUP RECEIVER NODE",
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF00639B),
+                        color = MaterialTheme.colorScheme.primary,
                         letterSpacing = 0.5.sp
                     )
                     
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(8.dp))
-                            .background(if (isRunning) Color(0xFFD1E4FF) else Color(0xFFDDE2F0))
+                            .background(if (isRunning) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant)
                             .padding(horizontal = 8.dp, vertical = 4.dp)
                     ) {
                         Text(
                             text = if (isRunning) "ACTIVE ADVERTISING" else "STANDBY",
                             fontSize = 8.sp,
                             fontWeight = FontWeight.Bold,
-                            color = if (isRunning) Color(0xFF001D36) else Color(0xFF43474E)
+                            color = if (isRunning) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
@@ -3188,7 +3494,7 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                     Icon(
                         imageVector = if (isRunning) Icons.Default.Search else Icons.Default.Warning,
                         contentDescription = null,
-                        tint = if (isRunning) Color(0xFF00639B) else Color(0xFF43474E),
+                        tint = if (isRunning) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(36.dp)
                     )
                     Spacer(modifier = Modifier.width(12.dp))
@@ -3197,13 +3503,13 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                             text = "Backup_${dynamicDeviceModel.replace(" ", "_")}",
                             fontSize = 15.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color(0xFF191C1E)
+                            color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
                             text = if (isRunning) "Listening on http://$serverIp:$serverPort/api/v1/upload" 
                                    else "Requires static Shared LAN connection",
                             fontSize = 10.sp,
-                            color = Color(0xFF43474E)
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
@@ -3215,8 +3521,8 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(12.dp))
-                            .background(Color(0xFF00639B).copy(alpha = 0.08f))
-                            .border(1.dp, Color(0xFF00639B).copy(alpha = 0.15f), RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f))
+                            .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.15f), RoundedCornerShape(12.dp))
                             .padding(12.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
@@ -3224,7 +3530,7 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                             text = "ONE-TIME SECURE PAIRING CODE",
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
-                            color = Color(0xFF00639B),
+                            color = MaterialTheme.colorScheme.primary,
                             letterSpacing = 0.5.sp
                         )
                         Spacer(modifier = Modifier.height(4.dp))
@@ -3232,7 +3538,7 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                             text = pairingPinVal,
                             fontSize = 32.sp,
                             fontWeight = FontWeight.ExtraBold,
-                            color = Color(0xFF00639B),
+                            color = MaterialTheme.colorScheme.primary,
                             letterSpacing = 6.sp,
                             textAlign = TextAlign.Center
                         )
@@ -3240,7 +3546,7 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                         Text(
                             text = "Enter this PIN on the sender device of the pairing connection.",
                             fontSize = 9.sp,
-                            color = Color(0xFF43474E),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center
                         )
                     }
@@ -3255,15 +3561,15 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(16.dp))
-                        .background(Color.White)
-                        .border(1.dp, Color(0xFFDDE2F0), RoundedCornerShape(16.dp))
+                        .background(MaterialTheme.colorScheme.surface)
+                        .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.15f), RoundedCornerShape(16.dp))
                         .padding(16.dp)
                 ) {
                     Text(
                         text = "RECEIVING PHOTO DATA",
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF00639B),
+                        color = MaterialTheme.colorScheme.primary,
                         letterSpacing = 0.5.sp
                     )
                     Spacer(modifier = Modifier.height(6.dp))
@@ -3271,7 +3577,7 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                         text = receiverProgressName,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color(0xFF191C1E)
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     val animatedProgress by animateFloatAsState(targetValue = receiverProgressVal, label = "receiverProgress")
@@ -3281,8 +3587,8 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                             .fillMaxWidth()
                             .height(6.dp)
                             .clip(RoundedCornerShape(3.dp)),
-                        color = Color(0xFF00639B),
-                        trackColor = Color(0xFFDDE2F0),
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant,
                     )
                 }
             }
@@ -3294,15 +3600,15 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(16.dp))
-                    .background(Color.White)
-                    .border(1.dp, Color(0xFFDDE2F0), RoundedCornerShape(16.dp))
+                    .background(MaterialTheme.colorScheme.surface)
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.15f), RoundedCornerShape(16.dp))
                     .padding(16.dp)
             ) {
                 Text(
                     text = "BACKUP GALLERY HISTORY",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
-                    color = Color(0xFF00639B),
+                    color = MaterialTheme.colorScheme.primary,
                     letterSpacing = 0.5.sp,
                     modifier = Modifier.padding(bottom = 12.dp)
                 )
@@ -3317,19 +3623,19 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                         Icon(
                             imageVector = Icons.Default.List,
                             contentDescription = null,
-                            tint = Color(0xFFDDE2F0),
+                            tint = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f),
                             modifier = Modifier.size(56.dp)
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
                             text = "No backup images received inside this session.",
                             fontSize = 11.sp,
-                            color = Color(0xFF43474E)
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         Text(
                             text = "Stored photos can be resolved inside DCIM/BackupSync directory.",
                             fontSize = 9.sp,
-                            color = Color(0xFF43474E).copy(alpha = 0.7f)
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
                         )
                     }
                 } else {
@@ -3339,8 +3645,8 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                             .padding(bottom = 8.dp),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text(text = "Transferred this Session:", fontSize = 12.sp, color = Color(0xFF191C1E), fontWeight = FontWeight.Bold)
-                        Text(text = "${receivedPhotos.size} Photos", fontSize = 12.sp, color = Color(0xFF00639B), fontWeight = FontWeight.Bold)
+                        Text(text = "Transferred this Session:", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.Bold)
+                        Text(text = "${receivedPhotos.size} Photos", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                     }
                     
                     // Custom grid layout using standard Rows list to avoid nested vertically scrollable components exception
@@ -3360,7 +3666,7 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                                         modifier = Modifier
                                             .weight(1f)
                                             .aspectRatio(1f)
-                                            .border(0.8.dp, Color(0xFFDDE2F0), RoundedCornerShape(8.dp)),
+                                            .border(0.8.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.15f), RoundedCornerShape(8.dp)),
                                         shape = RoundedCornerShape(8.dp)
                                     ) {
                                         Box(modifier = Modifier.fillMaxSize()) {

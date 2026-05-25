@@ -45,9 +45,28 @@
             android:exported="false" />
 
         <service
+            android:name=".ActiveSyncService"
+            android:foregroundServiceType="dataSync"
+            android:enabled="true"
+            android:exported="false" />
+
+        <service
             android:name=".AutoSyncJobService"
             android:permission="android.permission.BIND_JOB_SERVICE"
             android:exported="true" />
+
+        <receiver android:name=".ScheduledBackupReceiver" android:exported="false" />
+
+        <receiver
+            android:name=".PhotoSyncWidget"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/photo_sync_widget_info" />
+        </receiver>
     </application>
 
 </manifest>
