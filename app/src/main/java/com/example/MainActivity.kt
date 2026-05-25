@@ -953,11 +953,20 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
     private val _senderPairPin = MutableStateFlow("")
     val senderPairPin: StateFlow<String> = _senderPairPin.asStateFlow()
     
+    private val _rememberAutoPair = MutableStateFlow(false)
+    val rememberAutoPair: StateFlow<Boolean> = _rememberAutoPair.asStateFlow()
+    
     private val _autoSyncEnabled = MutableStateFlow(false)
     val autoSyncEnabled: StateFlow<Boolean> = _autoSyncEnabled.asStateFlow()
 
     fun setSenderPairPin(pin: String) {
         _senderPairPin.value = pin
+    }
+    
+    fun setRememberAutoPair(enabled: Boolean) {
+        _rememberAutoPair.value = enabled
+        val prefs = appContext.getSharedPreferences("PhotoSyncPrefs", Context.MODE_PRIVATE)
+        prefs.edit().putBoolean("remember_auto_pair", enabled).apply()
     }
     
     fun setAutoSyncEnabled(enabled: Boolean) {
@@ -1152,6 +1161,20 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
         
         val prefs = appContext.getSharedPreferences("PhotoSyncPrefs", Context.MODE_PRIVATE)
         _autoSyncEnabled.value = prefs.getBoolean("auto_sync_enabled", false)
+        _rememberAutoPair.value = prefs.getBoolean("remember_auto_pair", false)
+    }
+
+    private fun getWifiSsid(context: Context): String {
+        try {
+            if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+                val info = wifiManager?.connectionInfo
+                return info?.ssid?.removePrefix("\"")?.removeSuffix("\"") ?: "<unknown>"
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("PhotoSync", "Failed to retrieve SSID", e)
+        }
+        return "<unknown>"
     }
 
     fun setRole(role: String) {
@@ -1246,6 +1269,21 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
                 val current = _discoveredDevices.value.toMutableMap()
                 current[device.name] = device
                 _discoveredDevices.value = current
+                
+                val prefs = appContext.getSharedPreferences("PhotoSyncPrefs", Context.MODE_PRIVATE)
+                if (prefs.getBoolean("auto_pair_enabled", false)) {
+                    val prefName = prefs.getString("auto_pair_name", "")
+                    val prefSsid = prefs.getString("auto_pair_ssid", "")
+                    val prefPin = prefs.getString("auto_pair_pin", "")
+                    
+                    if (prefName == device.name) {
+                        val currentSsid = getWifiSsid(appContext)
+                        if (currentSsid == prefSsid) {
+                            _selectedDevice.value = device
+                            _senderPairPin.value = prefPin ?: ""
+                        }
+                    }
+                }
             },
             onDeviceLost = { name ->
                 val current = _discoveredDevices.value.toMutableMap()
@@ -1372,11 +1410,20 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
                         
                         // Save last target device credentials for auto-sync
                         val prefs = appContext.getSharedPreferences("PhotoSyncPrefs", Context.MODE_PRIVATE)
-                        prefs.edit()
-                            .putString("last_target_ip", target.ip)
-                            .putInt("last_target_port", target.port)
-                            .putString("last_target_pin", _senderPairPin.value)
-                            .apply()
+                        val editor = prefs.edit()
+                        editor.putString("last_target_ip", target.ip)
+                        editor.putInt("last_target_port", target.port)
+                        editor.putString("last_target_pin", _senderPairPin.value)
+                        
+                        if (_rememberAutoPair.value) {
+                            editor.putBoolean("auto_pair_enabled", true)
+                            editor.putString("auto_pair_name", target.name)
+                            editor.putString("auto_pair_pin", _senderPairPin.value)
+                            editor.putString("auto_pair_ssid", getWifiSsid(appContext))
+                        } else {
+                            editor.putBoolean("auto_pair_enabled", false)
+                        }
+                        editor.apply()
                             
                     } else if (resp.code == 401) {
                         handshakeErrorMsg = "Incorrect pairing PIN entered."
@@ -2113,6 +2160,13 @@ fun SenderFlowFrame(
     val selectedPhotos by viewModel.selectedPhotos.collectAsStateWithLifecycle()
     val deletionOption by viewModel.deletionOption.collectAsStateWithLifecycle()
     val syncState by viewModel.syncState.collectAsStateWithLifecycle()
+    val senderPin by viewModel.senderPairPin.collectAsStateWithLifecycle()
+    val rememberAutoPair by viewModel.rememberAutoPair.collectAsStateWithLifecycle()
+    val hasStoragePermission by viewModel.hasStoragePermission.collectAsStateWithLifecycle()
+    val availableFolders by viewModel.availableFolders.collectAsStateWithLifecycle()
+    val selectedFolderIds by viewModel.selectedFolderIds.collectAsStateWithLifecycle()
+    val isScanningFolders by viewModel.isScanningFolders.collectAsStateWithLifecycle()
+    val autoSyncEnabled by viewModel.autoSyncEnabled.collectAsStateWithLifecycle()
     var selectionMode by remember { mutableStateOf(0) } // 0 = Photo Picker, 1 = Backup Folders
     
     // Android Visual Photo Picker launcher
@@ -2247,7 +2301,7 @@ fun SenderFlowFrame(
         // Step 1.5: Pairing Code Authorization PIN (For Requirement 3 PIN security)
         if (selectedDevice != null) {
             item {
-                val pinVal by viewModel.senderPairPin.collectAsStateWithLifecycle()
+                val pinVal = senderPin
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -2298,6 +2352,27 @@ fun SenderFlowFrame(
                             keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
                         )
                     )
+                    
+                    Spacer(modifier = Modifier.height(10.dp))
+                    
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { viewModel.setRememberAutoPair(!rememberAutoPair) }
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = rememberAutoPair,
+                            onCheckedChange = { chk -> viewModel.setRememberAutoPair(chk) }
+                        )
+                        Text(
+                            text = "Auto-pair with this device on this Wi-Fi network",
+                            fontSize = 12.sp,
+                            color = Color(0xFF43474E)
+                        )
+                    }
                 }
             }
         }
@@ -2418,10 +2493,6 @@ fun SenderFlowFrame(
                         )
                     }
                 } else {
-                    val hasStoragePermission by viewModel.hasStoragePermission.collectAsStateWithLifecycle()
-                    val availableFolders by viewModel.availableFolders.collectAsStateWithLifecycle()
-                    val selectedFolderIds by viewModel.selectedFolderIds.collectAsStateWithLifecycle()
-                    val isScanningFolders by viewModel.isScanningFolders.collectAsStateWithLifecycle()
                     
                     val permissionLauncher = rememberLauncherForActivityResult(
                         contract = ActivityResultContracts.RequestPermission(),
@@ -2973,8 +3044,6 @@ fun SenderFlowFrame(
 
         // Action Trigger Button
         item {
-            val senderPin by viewModel.senderPairPin.collectAsStateWithLifecycle()
-            val autoSyncEnabled by viewModel.autoSyncEnabled.collectAsStateWithLifecycle()
             
             val canLaunch = selectedDevice != null && 
                             senderPin.length == 4 && 
@@ -3067,6 +3136,7 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
     val receiverProgressName by viewModel.receiverProgressName.collectAsStateWithLifecycle()
     val receiverProgressVal by viewModel.receiverProgressVal.collectAsStateWithLifecycle()
     val receivedPhotos by viewModel.receivedPhotos.collectAsStateWithLifecycle()
+    val pairingPinVal by LocalServerService.pairingPin.collectAsStateWithLifecycle()
 
     val dynamicDeviceModel = Build.MODEL
 
@@ -3139,7 +3209,6 @@ fun ReceiverFlowFrame(viewModel: PhotoSyncViewModel) {
                 }
                 
                 // Show Secure Pairing PIN if service is active
-                val pairingPinVal by LocalServerService.pairingPin.collectAsStateWithLifecycle()
                 if (isRunning && pairingPinVal.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(14.dp))
                     Column(
