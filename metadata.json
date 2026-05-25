@@ -1,0 +1,6 @@
+{
+  "name": "Photo Sync",
+  "description": "Direct photo transfers and cleanup between Android devices over local Wi-Fi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
