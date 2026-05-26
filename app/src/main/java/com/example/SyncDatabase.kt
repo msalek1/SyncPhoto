@@ -14,6 +14,7 @@ data class SyncHistoryRecord(
     val targetDeviceName: String,
     val status: String, // "SUCCESS", "FAILED", "PARTIAL"
     val bytesTransferred: Long,
+    val mediaType: String = "IMAGE", // "IMAGE" or "VIDEO"
     val timestamp: Long = System.currentTimeMillis()
 )
 
@@ -57,7 +58,7 @@ interface PairedDeviceDao {
     suspend fun deleteDevice(device: PairedDevice)
 }
 
-@Database(entities = [SyncHistoryRecord::class, PairedDevice::class], version = 1, exportSchema = false)
+@Database(entities = [SyncHistoryRecord::class, PairedDevice::class], version = 2, exportSchema = false)
 abstract class SyncDatabase : RoomDatabase() {
     abstract fun syncHistoryDao(): SyncHistoryDao
     abstract fun pairedDeviceDao(): PairedDeviceDao

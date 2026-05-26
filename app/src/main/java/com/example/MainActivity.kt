@@ -446,6 +446,21 @@ class LocalPhotoServer(
     
     fun start() {
         isRunning = true
+        // Clean up partial uploads older than 24 hours
+        try {
+            val partialDir = java.io.File(context.cacheDir, "partial_uploads")
+            if (partialDir.exists()) {
+                val threshold = System.currentTimeMillis() - 24 * 3600 * 1000L // 24 hours
+                partialDir.listFiles()?.forEach { file ->
+                    if (file.lastModified() < threshold) {
+                        file.delete()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("LocalPhotoServer", "Error cleaning partial uploads", e)
+        }
+
         serverExecutor.execute {
             try {
                 while (isRunning) {
@@ -546,6 +561,8 @@ class LocalPhotoServer(
                 var fileTotalSize = 0L
                 var isGzip = false
                 var senderDeviceName = "Sender_Device"
+                var senderMime = ""
+                var dateTaken = 0L
 
                 for (line in headerLines) {
                     if (line.startsWith("Content-Length:", ignoreCase = true)) {
@@ -574,6 +591,12 @@ class LocalPhotoServer(
                     }
                     if (line.startsWith("X-Device-Name:", ignoreCase = true)) {
                         senderDeviceName = line.substringAfter(":").trim()
+                    }
+                    if (line.startsWith("X-File-MIME:", ignoreCase = true)) {
+                        senderMime = line.substringAfter(":").trim()
+                    }
+                    if (line.startsWith("X-Date-Taken:", ignoreCase = true)) {
+                        dateTaken = line.substringAfter(":").trim().toLongOrNull() ?: 0L
                     }
                 }
 
@@ -658,7 +681,8 @@ class LocalPhotoServer(
 
                 // Insufficient Storage Check
                 try {
-                    val stat = StatFs(Environment.getExternalStorageDirectory().path)
+                    val storagePath = context.getExternalFilesDir(null)?.absolutePath ?: context.cacheDir.absolutePath
+                    val stat = StatFs(storagePath)
                     val bytesAvailable = stat.availableBytes
                     if (fileTotalSize > bytesAvailable) {
                         sendResponse(507, "Insufficient storage space.")
@@ -729,7 +753,14 @@ class LocalPhotoServer(
                                   filename.lowercase().endsWith(".avi") ||
                                   filename.lowercase().endsWith(".mov")
                     
-                    val mimeType = if (isVideo) "video/mp4" else "image/jpeg"
+                    val ext = filename.substringAfterLast('.', "").lowercase()
+                    val detectedMime = if (ext.isNotEmpty()) {
+                        android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+                    } else null
+                    val mimeType = if (!senderMime.isNullOrEmpty()) senderMime else {
+                        detectedMime ?: (if (isVideo) "video/mp4" else "image/jpeg")
+                    }
+
                     val parentCollection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         if (isVideo) MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
                         else MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
@@ -742,6 +773,9 @@ class LocalPhotoServer(
                     val contentValues = ContentValues().apply {
                         put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
                         put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                        if (dateTaken > 0L) {
+                            put(MediaStore.Images.Media.DATE_TAKEN, dateTaken)
+                        }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                             put(MediaStore.MediaColumns.RELATIVE_PATH, if (isVideo) "Movies/BackupSync" else "DCIM/BackupSync")
                             put(MediaStore.MediaColumns.IS_PENDING, 1)
@@ -788,7 +822,8 @@ class LocalPhotoServer(
                                         direction = "RECEIVER",
                                         targetDeviceName = senderDeviceName,
                                         status = "SUCCESS",
-                                        bytesTransferred = fileTotalSize
+                                        bytesTransferred = fileTotalSize,
+                                        mediaType = if (isVideo) "VIDEO" else "IMAGE"
                                     )
                                 )
                             }
@@ -811,7 +846,8 @@ class LocalPhotoServer(
                                         direction = "RECEIVER",
                                         targetDeviceName = senderDeviceName,
                                         status = "FAILED",
-                                        bytesTransferred = partialFile.length()
+                                        bytesTransferred = partialFile.length(),
+                                        mediaType = if (isVideo) "VIDEO" else "IMAGE"
                                     )
                                 )
                             }
@@ -824,6 +860,11 @@ class LocalPhotoServer(
                     // Log partial state
                     try {
                         val db = SyncDatabase.getDatabase(context)
+                        val isVideo = filename.lowercase().endsWith(".mp4") ||
+                                      filename.lowercase().endsWith(".mkv") ||
+                                      filename.lowercase().endsWith(".3gp") ||
+                                      filename.lowercase().endsWith(".avi") ||
+                                      filename.lowercase().endsWith(".mov")
                         kotlinx.coroutines.runBlocking {
                             db.syncHistoryDao().insertRecord(
                                 SyncHistoryRecord(
@@ -833,7 +874,8 @@ class LocalPhotoServer(
                                     direction = "RECEIVER",
                                     targetDeviceName = senderDeviceName,
                                     status = "PARTIAL",
-                                    bytesTransferred = currentSize
+                                    bytesTransferred = currentSize,
+                                    mediaType = if (isVideo) "VIDEO" else "IMAGE"
                                 )
                             )
                         }
@@ -853,12 +895,18 @@ class LocalPhotoServer(
         return digest.digest(bytes).joinToString("") { "%02x".format(it) }
     }
 
+    private fun isVideoFile(filename: String): Boolean {
+        val lower = filename.lowercase()
+        return lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".3gp") || lower.endsWith(".avi") || lower.endsWith(".mov")
+    }
+
     private fun isFileExisting(context: Context, filename: String): Boolean {
         val resolver = context.contentResolver
-        val queryUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        val projection = arrayOf(MediaStore.Images.Media._ID)
+        val isVideo = isVideoFile(filename)
+        val queryUri = if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val projection = arrayOf(MediaStore.MediaColumns._ID)
         val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
-        val selectionArgs = arrayOf(filename, "DCIM/BackupSync%")
+        val selectionArgs = arrayOf(filename, if (isVideo) "Movies/BackupSync%" else "DCIM/BackupSync%")
         try {
             resolver.query(queryUri, projection, selection, selectionArgs, null)?.use { cursor ->
                 return cursor.count > 0
@@ -871,10 +919,11 @@ class LocalPhotoServer(
 
     private fun isExactDuplicateExisting(context: Context, filename: String, length: Long): Boolean {
         val resolver = context.contentResolver
-        val queryUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val isVideo = isVideoFile(filename)
+        val queryUri = if (isVideo) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         val projection = arrayOf(MediaStore.MediaColumns.SIZE)
         val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
-        val selectionArgs = arrayOf(filename, "DCIM/BackupSync%")
+        val selectionArgs = arrayOf(filename, if (isVideo) "Movies/BackupSync%" else "DCIM/BackupSync%")
         try {
             resolver.query(queryUri, projection, selection, selectionArgs, null)?.use { cursor ->
                 if (cursor.moveToFirst()) {
@@ -991,6 +1040,15 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
     private val _autoSyncEnabled = MutableStateFlow(false)
     val autoSyncEnabled: StateFlow<Boolean> = _autoSyncEnabled.asStateFlow()
 
+    private val _includeVideos = MutableStateFlow(true)
+    val includeVideos: StateFlow<Boolean> = _includeVideos.asStateFlow()
+    
+    fun setIncludeVideos(enabled: Boolean) {
+        _includeVideos.value = enabled
+        val prefs = appContext.getSharedPreferences("PhotoSyncPrefs", Context.MODE_PRIVATE)
+        prefs.edit().putBoolean("include_videos", enabled).apply()
+    }
+
     fun setSenderPairPin(pin: String) {
         _senderPairPin.value = pin
     }
@@ -1106,7 +1164,8 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
 
     fun checkAndLoadFolders() {
         val hasPerm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(appContext, android.Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(appContext, android.Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(appContext, android.Manifest.permission.READ_MEDIA_VIDEO) == PackageManager.PERMISSION_GRANTED
         } else {
             ContextCompat.checkSelfPermission(appContext, android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
         }
@@ -1123,8 +1182,9 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
             val foldersMap = mutableMapOf<String, Pair<String, Int>>()
             val folderFirstUriMap = mutableMapOf<String, Uri>()
             
-            val uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-            val projection = arrayOf(
+            // 1. Scan Images
+            val imageUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            val imageProj = arrayOf(
                 MediaStore.Images.Media.BUCKET_ID,
                 MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
                 MediaStore.Images.Media._ID
@@ -1132,8 +1192,8 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
             
             try {
                 appContext.contentResolver.query(
-                    uri,
-                    projection,
+                    imageUri,
+                    imageProj,
                     null,
                     null,
                     "${MediaStore.Images.Media.DATE_TAKEN} DESC"
@@ -1158,8 +1218,46 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
                     }
                 }
             } catch (e: Exception) {
-                Log.e("ViewModel", "Failed to query folders", e)
-                _globalError.value = "Failed to query device folders: ${e.localizedMessage}"
+                Log.e("ViewModel", "Failed to query image folders", e)
+            }
+
+            // 2. Scan Videos
+            val videoUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            val videoProj = arrayOf(
+                MediaStore.Video.Media.BUCKET_ID,
+                MediaStore.Video.Media.BUCKET_DISPLAY_NAME,
+                MediaStore.Video.Media._ID
+            )
+            
+            try {
+                appContext.contentResolver.query(
+                    videoUri,
+                    videoProj,
+                    null,
+                    null,
+                    "${MediaStore.Video.Media.DATE_TAKEN} DESC"
+                )?.use { cursor ->
+                    val bucketIdCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.BUCKET_ID)
+                    val bucketNameCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.BUCKET_DISPLAY_NAME)
+                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                    
+                    while (cursor.moveToNext()) {
+                        val bucketId = cursor.getString(bucketIdCol) ?: "unknown"
+                        val bucketName = cursor.getString(bucketNameCol) ?: "Unknown Folder"
+                        val id = cursor.getLong(idCol)
+                        val videoContentUri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
+                        
+                        val current = foldersMap[bucketId]
+                        if (current == null) {
+                            foldersMap[bucketId] = Pair(bucketName, 1)
+                            folderFirstUriMap[bucketId] = videoContentUri
+                        } else {
+                            foldersMap[bucketId] = Pair(current.first, current.second + 1)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("ViewModel", "Failed to query video folders", e)
             }
             
             val list = foldersMap.map { (bucketId, pair) ->
@@ -1197,23 +1295,21 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
         _syncState.value = SyncState.Preparation
         viewModelScope.launch(Dispatchers.IO) {
             val payloads = mutableListOf<PhotoPayload>()
-            val digest = MessageDigest.getInstance("SHA-256")
-            val buffer = ByteArray(8192)
             
-            val uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-            val projection = arrayOf(
+            // 1. Query Images in Selected Folders
+            val imageUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            val imageProj = arrayOf(
                 MediaStore.Images.Media._ID,
                 MediaStore.Images.Media.DISPLAY_NAME,
                 MediaStore.Images.Media.SIZE
             )
-            
             val selection = folderIds.joinToString(separator = " OR ") { "${MediaStore.Images.Media.BUCKET_ID} = ?" }
             val selectionArgs = folderIds.toTypedArray()
             
             try {
                 appContext.contentResolver.query(
-                    uri,
-                    projection,
+                    imageUri,
+                    imageProj,
                     selection,
                     selectionArgs,
                     "${MediaStore.Images.Media.DATE_TAKEN} DESC"
@@ -1228,16 +1324,8 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
                         val size = cursor.getLong(sizeCol)
                         val photoUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
                         
-                        digest.reset()
                         try {
-                            appContext.contentResolver.openInputStream(photoUri)?.use { stream ->
-                                var read = stream.read(buffer)
-                                while (read != -1) {
-                                    digest.update(buffer, 0, read)
-                                    read = stream.read(buffer)
-                                }
-                            }
-                            val hash = digest.digest().joinToString("") { "%02x".format(it) }
+                            val hash = computeFileHash(photoUri, size)
                             payloads.add(PhotoPayload(photoUri, filename, size, hash))
                         } catch (e: Exception) {
                             Log.e("ViewModel", "Hashing failed for $filename: ${e.localizedMessage}")
@@ -1245,8 +1333,47 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
                     }
                 }
             } catch (e: Exception) {
-                Log.e("ViewModel", "Failed to query files in folders", e)
-                _globalError.value = "Failed to load photos: ${e.localizedMessage}"
+                Log.e("ViewModel", "Failed to query image folder files", e)
+            }
+
+            // 2. Query Videos in Selected Folders
+            val videoUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            val videoProj = arrayOf(
+                MediaStore.Video.Media._ID,
+                MediaStore.Video.Media.DISPLAY_NAME,
+                MediaStore.Video.Media.SIZE
+            )
+            val videoSelection = folderIds.joinToString(separator = " OR ") { "${MediaStore.Video.Media.BUCKET_ID} = ?" }
+            val videoSelectionArgs = folderIds.toTypedArray()
+            
+            try {
+                appContext.contentResolver.query(
+                    videoUri,
+                    videoProj,
+                    videoSelection,
+                    videoSelectionArgs,
+                    "${MediaStore.Video.Media.DATE_TAKEN} DESC"
+                )?.use { cursor ->
+                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                    val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
+                    val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
+                    
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getLong(idCol)
+                        val filename = cursor.getString(nameCol) ?: "VID_${System.currentTimeMillis()}.mp4"
+                        val size = cursor.getLong(sizeCol)
+                        val videoContentUri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
+                        
+                        try {
+                            val hash = computeFileHash(videoContentUri, size)
+                            payloads.add(PhotoPayload(videoContentUri, filename, size, hash))
+                        } catch (e: Exception) {
+                            Log.e("ViewModel", "Hashing failed for $filename: ${e.localizedMessage}")
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("ViewModel", "Failed to query video folder files", e)
             }
             
             _selectedPhotos.value = payloads
@@ -1264,6 +1391,7 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
         
         val prefs = appContext.getSharedPreferences("PhotoSyncPrefs", Context.MODE_PRIVATE)
         _autoSyncEnabled.value = prefs.getBoolean("auto_sync_enabled", false)
+        _includeVideos.value = prefs.getBoolean("include_videos", true)
         _rememberAutoPair.value = prefs.getBoolean("remember_auto_pair", false)
         _scheduleEnabled.value = prefs.getBoolean("schedule_enabled", false)
         _scheduleTime.value = prefs.getString("schedule_time", "02:00") ?: "02:00"
@@ -1422,12 +1550,70 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
         _selectedFolderIds.value = emptySet()
     }
 
+    private fun computeFileHash(uri: Uri, size: Long): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        // If file is larger than 10MB, use a quick hashing strategy
+        if (size > 10 * 1024 * 1024L) {
+            try {
+                digest.update("size_$size".toByteArray())
+                // Hash first 1MB
+                appContext.contentResolver.openInputStream(uri)?.use { stream ->
+                    val buf = ByteArray(8192)
+                    var readTotal = 0L
+                    while (readTotal < 1024 * 1024L) {
+                        val toRead = minOf(buf.size.toLong(), 1024 * 1024L - readTotal).toInt()
+                        val read = stream.read(buf, 0, toRead)
+                        if (read == -1) break
+                        digest.update(buf, 0, read)
+                        readTotal += read
+                    }
+                }
+                
+                // Hash last 1MB
+                val pfd = appContext.contentResolver.openFileDescriptor(uri, "r")
+                pfd?.use { fd ->
+                    val fileLength = fd.statSize
+                    if (fileLength > 1024 * 1024L) {
+                        val startOffset = fileLength - 1024 * 1024L
+                        val stream = java.io.FileInputStream(fd.fileDescriptor)
+                        stream.channel.position(startOffset)
+                        val buf = ByteArray(8192)
+                        var readTotal = 0L
+                        while (readTotal < 1024 * 1024L) {
+                            val toRead = minOf(buf.size.toLong(), 1024 * 1024L - readTotal).toInt()
+                            val read = stream.read(buf, 0, toRead)
+                            if (read == -1) break
+                            digest.update(buf, 0, read)
+                            readTotal += read
+                        }
+                    }
+                }
+                return digest.digest().joinToString("") { "%02x".format(it) }
+            } catch (e: Exception) {
+                Log.w("ViewModel", "Quick hashing failed, falling back to full", e)
+            }
+        }
+        
+        // Full file hashing fallback
+        try {
+            val buf = ByteArray(8192)
+            appContext.contentResolver.openInputStream(uri)?.use { stream ->
+                var read = stream.read(buf)
+                while (read != -1) {
+                    digest.update(buf, 0, read)
+                    read = stream.read(buf)
+                }
+            }
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        } catch (e: Exception) {
+            return "fallback_${System.currentTimeMillis()}"
+        }
+    }
+
     fun importSelectedUris(uris: List<Uri>) {
         _syncState.value = SyncState.Preparation
         viewModelScope.launch(Dispatchers.IO) {
             val payloads = mutableListOf<PhotoPayload>()
-            val digest = MessageDigest.getInstance("SHA-256")
-            val buffer = ByteArray(8192)
             
             for (uri in uris) {
                 var filename = "IMG_${System.currentTimeMillis()}.jpg"
@@ -1445,17 +1631,8 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
                     }
                 }
                 
-                // File Hashing Integrity Check
-                digest.reset()
                 try {
-                    appContext.contentResolver.openInputStream(uri)?.use { stream ->
-                        var read = stream.read(buffer)
-                        while (read != -1) {
-                            digest.update(buffer, 0, read)
-                            read = stream.read(buffer)
-                        }
-                    }
-                    val hash = digest.digest().joinToString("") { "%02x".format(it) }
+                    val hash = computeFileHash(uri, size)
                     payloads.add(PhotoPayload(uri, filename, size, hash))
                 } catch (e: Exception) {
                     Log.e("ViewModel", "Hashing failed: ${e.localizedMessage}")
@@ -1580,6 +1757,24 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
                 try {
                     val streamSize = payload.size
                     
+                    var localMime: String? = null
+                    var localDateTaken = 0L
+                    try {
+                        localMime = appContext.contentResolver.getType(payload.uri)
+                    } catch (e: Exception) {}
+
+                    try {
+                        val projection = arrayOf(MediaStore.MediaColumns.DATE_ADDED)
+                        appContext.contentResolver.query(payload.uri, projection, null, null, null)?.use { cursor ->
+                            if (cursor.moveToFirst()) {
+                                val dateAddedCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATE_ADDED)
+                                if (dateAddedCol != -1) {
+                                    localDateTaken = cursor.getLong(dateAddedCol) * 1000L
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {}
+
                     val fileBody = object : RequestBody() {
                         override fun contentType() = "application/octet-stream".toMediaTypeOrNull()
                         override fun contentLength() = streamSize
@@ -1609,13 +1804,21 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
                         }
                     }
 
-                    val request = Request.Builder()
+                    val requestBuilder = Request.Builder()
                         .url("http://${target.ip}:${target.port}/api/v1/upload")
                         .post(fileBody)
                         .addHeader("X-Pairing-PIN", _senderPairPin.value)
                         .addHeader("X-File-Name", Uri.encode(payload.filename))
                         .addHeader("X-File-Hash", payload.hash)
-                        .build()
+
+                    if (!localMime.isNullOrEmpty()) {
+                        requestBuilder.addHeader("X-File-MIME", localMime)
+                    }
+                    if (localDateTaken > 0L) {
+                        requestBuilder.addHeader("X-Date-Taken", localDateTaken.toString())
+                    }
+
+                    val request = requestBuilder.build()
 
                     client.newCall(request).execute().use { response ->
                         if (response.isSuccessful) {
@@ -2712,7 +2915,7 @@ fun SenderFlowFrame(
                     Button(
                         onClick = {
                             photoPickerLauncher.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
                             )
                         },
                         modifier = Modifier
@@ -2736,9 +2939,10 @@ fun SenderFlowFrame(
                 } else {
                     
                     val permissionLauncher = rememberLauncherForActivityResult(
-                        contract = ActivityResultContracts.RequestPermission(),
-                        onResult = { isGranted ->
-                            if (isGranted) {
+                        contract = ActivityResultContracts.RequestMultiplePermissions(),
+                        onResult = { result ->
+                            val allGranted = result.values.all { it }
+                            if (allGranted) {
                                 viewModel.loadLocalFolders()
                             } else {
                                 viewModel.checkAndLoadFolders()
@@ -2767,12 +2971,15 @@ fun SenderFlowFrame(
                             )
                             Button(
                                 onClick = {
-                                    val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                        android.Manifest.permission.READ_MEDIA_IMAGES
+                                    val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                        arrayOf(
+                                            android.Manifest.permission.READ_MEDIA_IMAGES,
+                                            android.Manifest.permission.READ_MEDIA_VIDEO
+                                        )
                                     } else {
-                                        android.Manifest.permission.READ_EXTERNAL_STORAGE
+                                        arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
                                     }
-                                    permissionLauncher.launch(perm)
+                                    permissionLauncher.launch(perms)
                                 },
                                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                                 shape = RoundedCornerShape(8.dp)
@@ -3318,6 +3525,45 @@ fun SenderFlowFrame(
                             if (selectedDevice != null && senderPin.length == 4) {
                                 viewModel.setAutoSyncEnabled(it)
                             }
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
+                            checkedTrackColor = MaterialTheme.colorScheme.primary,
+                            uncheckedThumbColor = MaterialTheme.colorScheme.outline,
+                            uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
+                        )
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Include Videos Option
+                val includeVideos by viewModel.includeVideos.collectAsStateWithLifecycle()
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Include Videos",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "Enable automatic background or directory backups of video files.",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            lineHeight = 14.sp
+                        )
+                    }
+                    Switch(
+                        checked = includeVideos,
+                        onCheckedChange = { 
+                            viewModel.setIncludeVideos(it)
                         },
                         colors = SwitchDefaults.colors(
                             checkedThumbColor = MaterialTheme.colorScheme.onPrimary,

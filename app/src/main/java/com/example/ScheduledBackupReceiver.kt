@@ -73,37 +73,75 @@ class ScheduledBackupReceiver : BroadcastReceiver() {
             }
 
             val lastSync = prefs.getLong("last_scheduled_sync", 0L)
+            val includeVideos = prefs.getBoolean("include_videos", true)
             
-            // Get new photos since last sync
-            val urisToUpload = mutableListOf<Uri>()
-            val projection = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATE_ADDED)
-            val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} ASC"
-            val selection = "${MediaStore.Images.Media.DATE_ADDED} > ?"
+            val mediaItems = mutableListOf<MediaItem>()
             
-            // DATE_ADDED is in seconds!
-            val selectionArgs = arrayOf((lastSync / 1000).toString())
-
+            // Query Images
             try {
+                val proj = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATE_ADDED, MediaStore.Images.Media.DISPLAY_NAME, MediaStore.Images.Media.SIZE)
+                val sel = "${MediaStore.Images.Media.DATE_ADDED} > ?"
+                val selArgs = arrayOf((lastSync / 1000).toString())
                 context.contentResolver.query(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    projection,
-                    selection,
-                    selectionArgs,
-                    sortOrder
+                    proj,
+                    sel,
+                    selArgs,
+                    null
                 )?.use { cursor ->
-                    val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                    val dateCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+                    val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+                    val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)
                     while (cursor.moveToNext()) {
-                        val id = cursor.getLong(idColumn)
+                        val id = cursor.getLong(idCol)
+                        val dateAdded = cursor.getLong(dateCol)
+                        val filename = cursor.getString(nameCol) ?: "photo_${id}.jpg"
+                        val sizeBytes = cursor.getLong(sizeCol)
                         val contentUri = Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString())
-                        urisToUpload.add(contentUri)
+                        mediaItems.add(MediaItem(contentUri, dateAdded, false, filename, sizeBytes))
                     }
                 }
             } catch (e: Exception) {
-                Log.e("ScheduledBackup", "Failed to query media", e)
+                Log.e("ScheduledBackup", "Failed to query image media", e)
             }
 
-            if (urisToUpload.isEmpty()) {
-                updateLastStatus(context, "Up to date: No new photos found")
+            // Query Videos
+            if (includeVideos) {
+                try {
+                    val proj = arrayOf(MediaStore.Video.Media._ID, MediaStore.Video.Media.DATE_ADDED, MediaStore.Video.Media.DISPLAY_NAME, MediaStore.Video.Media.SIZE)
+                    val sel = "${MediaStore.Video.Media.DATE_ADDED} > ?"
+                    val selArgs = arrayOf((lastSync / 1000).toString())
+                    context.contentResolver.query(
+                        MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                        proj,
+                        sel,
+                        selArgs,
+                        null
+                    )?.use { cursor ->
+                        val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                        val dateCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DATE_ADDED)
+                        val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
+                        val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
+                        while (cursor.moveToNext()) {
+                            val id = cursor.getLong(idCol)
+                            val dateAdded = cursor.getLong(dateCol)
+                            val filename = cursor.getString(nameCol) ?: "video_${id}.mp4"
+                            val sizeBytes = cursor.getLong(sizeCol)
+                            val contentUri = Uri.withAppendedPath(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id.toString())
+                            mediaItems.add(MediaItem(contentUri, dateAdded, true, filename, sizeBytes))
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("ScheduledBackup", "Failed to query video media", e)
+                }
+            }
+
+            // Sort consolidated items chronologically
+            mediaItems.sortBy { it.dateAdded }
+
+            if (mediaItems.isEmpty()) {
+                updateLastStatus(context, "Up to date: No new media found")
                 return@launch
             }
 
@@ -138,21 +176,19 @@ class ScheduledBackupReceiver : BroadcastReceiver() {
             }
 
             var successCount = 0
-            for (uri in urisToUpload) {
+            for (item in mediaItems) {
                 try {
-                    var filename = uri.lastPathSegment?.plus(".jpg") ?: "scheduled_${System.currentTimeMillis()}.jpg"
-                    context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                        val nameIdx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                        if (nameIdx >= 0 && cursor.moveToFirst()) {
-                            filename = cursor.getString(nameIdx)
-                        }
-                    }
+                    var localMime: String? = null
+                    var localDateTaken = item.dateAdded * 1000L // DATE_ADDED is in seconds, convert to ms
+                    try {
+                        localMime = context.contentResolver.getType(item.uri)
+                    } catch (e: Exception) {}
 
                     val requestBody = object : RequestBody() {
                         override fun contentType() = "application/octet-stream".toMediaTypeOrNull()
-                        override fun contentLength() = -1L
+                        override fun contentLength() = item.size
                         override fun writeTo(sink: BufferedSink) {
-                            context.contentResolver.openInputStream(uri)?.use { stream ->
+                            context.contentResolver.openInputStream(item.uri)?.use { stream ->
                                 val buffer = ByteArray(65536)
                                 var bytesRead: Int
                                 while (stream.read(buffer).also { bytesRead = it } != -1) {
@@ -162,12 +198,21 @@ class ScheduledBackupReceiver : BroadcastReceiver() {
                         }
                     }
 
-                    val uploadRequest = Request.Builder()
+                    val fileHash = "scheduled_${item.filename}_${item.size}"
+                    val uploadRequestBuilder = Request.Builder()
                         .url("http://$targetIp:$targetPort/api/v1/upload")
                         .addHeader("X-Pairing-PIN", pin)
-                        .addHeader("X-File-Name", Uri.encode(filename))
-                        .post(requestBody)
-                        .build()
+                        .addHeader("X-File-Name", Uri.encode(item.filename))
+                        .addHeader("X-File-Hash", fileHash)
+                    
+                    if (!localMime.isNullOrEmpty()) {
+                        uploadRequestBuilder.addHeader("X-File-MIME", localMime)
+                    }
+                    if (localDateTaken > 0L) {
+                        uploadRequestBuilder.addHeader("X-Date-Taken", localDateTaken.toString())
+                    }
+
+                    val uploadRequest = uploadRequestBuilder.post(requestBody).build()
 
                     client.newCall(uploadRequest).execute().use { resp ->
                         if (resp.code == 200 || resp.code == 409) {
@@ -176,13 +221,14 @@ class ScheduledBackupReceiver : BroadcastReceiver() {
                             val db = SyncDatabase.getDatabase(context)
                             db.syncHistoryDao().insertRecord(
                                 SyncHistoryRecord(
-                                    filename = filename,
-                                    fileHash = "scheduled_${System.currentTimeMillis()}", // dummy hash to avoid reading twice
-                                    sizeBytes = 0L,
+                                    filename = item.filename,
+                                    fileHash = fileHash,
+                                    sizeBytes = item.size,
                                     direction = "SENDER",
                                     targetDeviceName = autoPairName.ifEmpty { "Preferred Device" },
                                     status = "SUCCESS",
-                                    bytesTransferred = 0L,
+                                    bytesTransferred = item.size,
+                                    mediaType = if (item.isVideo) "VIDEO" else "IMAGE"
                                 )
                             )
                         }
@@ -194,7 +240,7 @@ class ScheduledBackupReceiver : BroadcastReceiver() {
 
             if (successCount > 0) {
                 prefs.edit().putLong("last_scheduled_sync", System.currentTimeMillis()).apply()
-                updateLastStatus(context, "Success: Sent $successCount photos")
+                updateLastStatus(context, "Success: Sent $successCount media items")
                 
                 val manager = context.getSystemService(NotificationManager::class.java)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -204,14 +250,14 @@ class ScheduledBackupReceiver : BroadcastReceiver() {
                 
                 val builder = NotificationCompat.Builder(context, "scheduled_sync_channel")
                     .setSmallIcon(android.R.drawable.ic_menu_upload)
-                    .setContentTitle("Scheduled Photo Backup Complete")
-                    .setContentText("Successfully backed up $successCount photos.")
+                    .setContentTitle("Scheduled Media Backup Complete")
+                    .setContentText("Successfully backed up $successCount media items.")
                     .setPriority(NotificationCompat.PRIORITY_DEFAULT)
                     .setAutoCancel(true)
                     
                 manager.notify(2001, builder.build())
             } else {
-                updateLastStatus(context, "Failed: Photos failed to transfer")
+                updateLastStatus(context, "Failed: Media files failed to transfer")
             }
         }
     }
@@ -255,3 +301,11 @@ class ScheduledBackupReceiver : BroadcastReceiver() {
             .apply()
     }
 }
+
+private data class MediaItem(
+    val uri: Uri,
+    val dateAdded: Long,
+    val isVideo: Boolean,
+    val filename: String,
+    val size: Long
+)

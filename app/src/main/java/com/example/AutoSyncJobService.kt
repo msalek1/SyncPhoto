@@ -7,6 +7,7 @@ import android.app.job.JobService
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import android.provider.MediaStore
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
@@ -29,6 +30,10 @@ class AutoSyncJobService : JobService() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 builder.addTriggerContentUri(android.app.job.JobInfo.TriggerContentUri(
                     android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    android.app.job.JobInfo.TriggerContentUri.FLAG_NOTIFY_FOR_DESCENDANTS
+                ))
+                builder.addTriggerContentUri(android.app.job.JobInfo.TriggerContentUri(
+                    android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
                     android.app.job.JobInfo.TriggerContentUri.FLAG_NOTIFY_FOR_DESCENDANTS
                 ))
                 builder.setTriggerContentUpdateDelay(2000)
@@ -56,6 +61,7 @@ class AutoSyncJobService : JobService() {
         val port = prefs.getInt("last_target_port", -1)
         val pin = prefs.getString("last_target_pin", null)
         val autoSyncEnabled = prefs.getBoolean("auto_sync_enabled", false)
+        val includeVideos = prefs.getBoolean("include_videos", true)
         val autoPairName = prefs.getString("auto_pair_name", "") ?: ""
         
         if (!autoSyncEnabled || pin == null) {
@@ -103,6 +109,17 @@ class AutoSyncJobService : JobService() {
                         }
                     } catch (e: Exception) {}
                     
+                    val isVideo = filename.lowercase().endsWith(".mp4") ||
+                                  filename.lowercase().endsWith(".mkv") ||
+                                  filename.lowercase().endsWith(".3gp") ||
+                                  filename.lowercase().endsWith(".avi") ||
+                                  filename.lowercase().endsWith(".mov")
+                    
+                    if (isVideo && !includeVideos) {
+                        Log.d("AutoSync", "Skipping video $filename because include_videos is disabled")
+                        continue
+                    }
+                    
                     // Simple ping to check if online
                     val pingRequest = Request.Builder()
                         .url("http://$targetIp:$targetPort/api/v1/ping")
@@ -146,17 +163,64 @@ class AutoSyncJobService : JobService() {
                                 }
                             }
                         }
-                        
-                        val uploadRequest = Request.Builder()
+
+                        var localMime: String? = null
+                        var localDateTaken = 0L
+                        try {
+                            localMime = contentResolver.getType(uri)
+                        } catch (e: Exception) {}
+
+                        try {
+                            val projection = arrayOf(MediaStore.MediaColumns.DATE_ADDED)
+                            contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+                                if (cursor.moveToFirst()) {
+                                    val dateAddedCol = cursor.getColumnIndex(MediaStore.MediaColumns.DATE_ADDED)
+                                    if (dateAddedCol != -1) {
+                                        localDateTaken = cursor.getLong(dateAddedCol) * 1000L
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) {}
+
+                        val uploadRequestBuilder = Request.Builder()
                             .url("http://$targetIp:$targetPort/api/v1/upload")
                             .addHeader("X-Pairing-PIN", pin)
                             .addHeader("X-File-Name", Uri.encode(filename))
-                            .post(requestBody)
-                            .build()
+                            .addHeader("X-File-Hash", "auto_${filename}_${requestBody.contentLength()}")
+                        
+                        if (!localMime.isNullOrEmpty()) {
+                            uploadRequestBuilder.addHeader("X-File-MIME", localMime)
+                        }
+                        if (localDateTaken > 0L) {
+                            uploadRequestBuilder.addHeader("X-Date-Taken", localDateTaken.toString())
+                        }
+
+                        val uploadRequest = uploadRequestBuilder.post(requestBody).build()
                             
                         client.newCall(uploadRequest).execute().use { resp ->
-                            if (resp.code == 200) {
+                            if (resp.code == 200 || resp.code == 409) {
                                 sendNotification(filename)
+                                try {
+                                    val db = SyncDatabase.getDatabase(applicationContext)
+                                    val isVideo = filename.lowercase().endsWith(".mp4") ||
+                                                  filename.lowercase().endsWith(".mkv") ||
+                                                  filename.lowercase().endsWith(".3gp") ||
+                                                  filename.lowercase().endsWith(".avi") ||
+                                                  filename.lowercase().endsWith(".mov")
+                                    val finalSize = requestBody.contentLength().coerceAtLeast(0L)
+                                    db.syncHistoryDao().insertRecord(
+                                        SyncHistoryRecord(
+                                            filename = filename,
+                                            fileHash = "auto_${filename}_$finalSize",
+                                            sizeBytes = finalSize,
+                                            direction = "SENDER",
+                                            targetDeviceName = autoPairName.ifEmpty { "Preferred Device" },
+                                            status = "SUCCESS",
+                                            bytesTransferred = finalSize,
+                                            mediaType = if (isVideo) "VIDEO" else "IMAGE"
+                                        )
+                                    )
+                                } catch (e: Exception) {}
                             }
                         }
                     }
