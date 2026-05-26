@@ -347,6 +347,31 @@ class NsdHelper(private val context: Context) {
             isResolving = false
         }
     }
+
+    fun resolveDeviceByName(targetName: String, timeoutSeconds: Int = 6): Pair<String, Int>? {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var result: Pair<String, Int>? = null
+        
+        discoverServices(
+            onDeviceFound = { device ->
+                if (device.name == targetName) {
+                    result = Pair(device.ip, device.port)
+                    latch.countDown()
+                }
+            },
+            onDeviceLost = {}
+        )
+        
+        try {
+            latch.await(timeoutSeconds.toLong(), java.util.concurrent.TimeUnit.SECONDS)
+        } catch (e: Exception) {
+            Log.e("NsdHelper", "Error waiting for device resolve", e)
+        } finally {
+            stopDiscovery()
+        }
+        
+        return result
+    }
     
     private fun queueResolve(serviceInfo: NsdServiceInfo, onDeviceFound: (DiscoveredDevice) -> Unit) {
         resolveLock.withLock {
@@ -976,6 +1001,28 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
     private val _scheduleTime = MutableStateFlow("02:00") // Default 2AM
     val scheduleTime: StateFlow<String> = _scheduleTime.asStateFlow()
 
+    private val _lastScheduledSyncTime = MutableStateFlow(0L)
+    val lastScheduledSyncTime: StateFlow<Long> = _lastScheduledSyncTime.asStateFlow()
+
+    private val _lastScheduledSyncStatus = MutableStateFlow("")
+    val lastScheduledSyncStatus: StateFlow<String> = _lastScheduledSyncStatus.asStateFlow()
+
+    fun refreshScheduledSyncStatus() {
+        val prefs = appContext.getSharedPreferences("PhotoSyncPrefs", Context.MODE_PRIVATE)
+        _lastScheduledSyncTime.value = prefs.getLong("last_scheduled_sync_time", 0L)
+        _lastScheduledSyncStatus.value = prefs.getString("last_scheduled_sync_status", "") ?: ""
+    }
+
+    fun triggerManualScheduledSync() {
+        val intent = android.content.Intent(appContext, ScheduledBackupReceiver::class.java)
+        appContext.sendBroadcast(intent)
+        // Give it a brief moment, then refresh
+        viewModelScope.launch {
+            kotlinx.coroutines.delay(1000)
+            refreshScheduledSyncStatus()
+        }
+    }
+
     fun setSchedule(enabled: Boolean, time: String) {
         _scheduleEnabled.value = enabled
         _scheduleTime.value = time
@@ -1220,6 +1267,7 @@ class PhotoSyncViewModel(context: Context) : ViewModel() {
         _rememberAutoPair.value = prefs.getBoolean("remember_auto_pair", false)
         _scheduleEnabled.value = prefs.getBoolean("schedule_enabled", false)
         _scheduleTime.value = prefs.getString("schedule_time", "02:00") ?: "02:00"
+        refreshScheduledSyncStatus()
     }
 
     private fun getWifiSsid(context: Context): String {
@@ -2352,6 +2400,8 @@ fun SenderFlowFrame(
     val autoSyncEnabled by viewModel.autoSyncEnabled.collectAsStateWithLifecycle()
     val scheduleEnabled by viewModel.scheduleEnabled.collectAsStateWithLifecycle()
     val scheduleTime by viewModel.scheduleTime.collectAsStateWithLifecycle()
+    val lastScheduledSyncTime by viewModel.lastScheduledSyncTime.collectAsStateWithLifecycle()
+    val lastScheduledSyncStatus by viewModel.lastScheduledSyncStatus.collectAsStateWithLifecycle()
     var selectionMode by remember { mutableStateOf(0) } // 0 = Photo Picker, 1 = Backup Folders
     
     // Android Visual Photo Picker launcher
@@ -3281,60 +3331,129 @@ fun SenderFlowFrame(
                 Spacer(modifier = Modifier.height(16.dp))
 
                 // Schedule Backup Option
-                Row(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.dp))
                         .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                        .padding(16.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                        .padding(16.dp)
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "Schedule Daily Backup",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = "Backs up new photos at $scheduleTime daily.",
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            lineHeight = 14.sp
-                        )
-                        
-                        if (scheduleEnabled) {
-                            Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Tap here to change time",
+                                text = "Schedule Daily Backup",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Backs up new photos at $scheduleTime daily.",
                                 fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                lineHeight = 14.sp
+                            )
+                        }
+                        Switch(
+                            checked = scheduleEnabled,
+                            onCheckedChange = { isChecked ->
+                                if (isChecked) {
+                                    if (selectedDevice != null && senderPin.length == 4) {
+                                        selectionMode = 3
+                                    }
+                                } else {
+                                    viewModel.setSchedule(false, scheduleTime)
+                                }
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
+                                checkedTrackColor = MaterialTheme.colorScheme.primary,
+                                uncheckedThumbColor = MaterialTheme.colorScheme.outline,
+                                uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
+                            )
+                        )
+                    }
+
+                    if (scheduleEnabled) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Change Time",
+                                fontSize = 10.sp,
                                 color = MaterialTheme.colorScheme.primary,
                                 fontWeight = FontWeight.Bold,
-                                modifier = Modifier.clickable {
-                                    selectionMode = 3 // We can use selectionMode or a boolean. Let's just avoid inline var and put a dialog variable.
-                                }
+                                modifier = Modifier
+                                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f), RoundedCornerShape(4.dp))
+                                    .clickable { selectionMode = 3 }
+                                    .padding(vertical = 4.dp, horizontal = 8.dp)
+                            )
+                            Text(
+                                text = "Sync Now",
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.ExtraBold,
+                                modifier = Modifier
+                                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f), RoundedCornerShape(4.dp))
+                                    .clickable { viewModel.triggerManualScheduledSync() }
+                                    .padding(vertical = 4.dp, horizontal = 8.dp)
+                            )
+                            Text(
+                                text = "Refresh Status",
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier
+                                    .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f), RoundedCornerShape(4.dp))
+                                    .clickable { viewModel.refreshScheduledSyncStatus() }
+                                    .padding(vertical = 4.dp, horizontal = 8.dp)
                             )
                         }
                     }
-                    Switch(
-                        checked = scheduleEnabled,
-                        onCheckedChange = { isChecked ->
-                            if (isChecked) {
-                                if (selectedDevice != null && senderPin.length == 4) {
-                                    selectionMode = 3
-                                }
-                            } else {
-                                viewModel.setSchedule(false, scheduleTime)
-                            }
-                        },
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
-                            checkedTrackColor = MaterialTheme.colorScheme.primary,
-                            uncheckedThumbColor = MaterialTheme.colorScheme.outline,
-                            uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
-                        )
-                    )
+
+                    if (lastScheduledSyncTime > 0L) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        val formattedTime = java.text.DateFormat.getDateTimeInstance().format(java.util.Date(lastScheduledSyncTime))
+                        val statusContrastColor = if (lastScheduledSyncStatus.contains("Success", ignoreCase = true)) {
+                            Color(0xFF2E7D32)
+                        } else if (lastScheduledSyncStatus.contains("Skipped", ignoreCase = true) || lastScheduledSyncStatus.contains("Up to date", ignoreCase = true)) {
+                            Color(0xFFEF6C00)
+                        } else {
+                            Color(0xFFC62828)
+                        }
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(statusContrastColor.copy(alpha = 0.08f))
+                                .padding(10.dp)
+                        ) {
+                            Text(
+                                text = "LAST BACKUP EXECUTION",
+                                fontSize = 8.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = statusContrastColor,
+                                letterSpacing = 0.5.sp
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = lastScheduledSyncStatus,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Executed: $formattedTime",
+                                fontSize = 9.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                 }
 
                 Button(

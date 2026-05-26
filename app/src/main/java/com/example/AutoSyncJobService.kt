@@ -56,8 +56,9 @@ class AutoSyncJobService : JobService() {
         val port = prefs.getInt("last_target_port", -1)
         val pin = prefs.getString("last_target_pin", null)
         val autoSyncEnabled = prefs.getBoolean("auto_sync_enabled", false)
+        val autoPairName = prefs.getString("auto_pair_name", "") ?: ""
         
-        if (!autoSyncEnabled || ip == null || port == -1 || pin == null) {
+        if (!autoSyncEnabled || pin == null) {
             jobFinished(params, false)
             return false
         }
@@ -69,6 +70,27 @@ class AutoSyncJobService : JobService() {
             .build()
             
         CoroutineScope(Dispatchers.IO).launch {
+            var targetIp = ip
+            var targetPort = port
+
+            if (autoPairName.isNotEmpty()) {
+                val nsdHelper = NsdHelper(applicationContext)
+                val resolved = nsdHelper.resolveDeviceByName(autoPairName)
+                if (resolved != null) {
+                    targetIp = resolved.first
+                    targetPort = resolved.second
+                    prefs.edit()
+                        .putString("last_target_ip", targetIp)
+                        .putInt("last_target_port", targetPort)
+                        .apply()
+                }
+            }
+
+            if (targetIp == null || targetPort == -1) {
+                jobFinished(params, false)
+                return@launch
+            }
+
             for (uri in uris) {
                 try {
                     var filename = uri.lastPathSegment?.plus(".jpg") ?: "auto_uploaded_${System.currentTimeMillis()}.jpg"
@@ -83,7 +105,7 @@ class AutoSyncJobService : JobService() {
                     
                     // Simple ping to check if online
                     val pingRequest = Request.Builder()
-                        .url("http://$ip:$port/api/v1/ping")
+                        .url("http://$targetIp:$targetPort/api/v1/ping")
                         .addHeader("X-Pairing-PIN", pin)
                         .get()
                         .build()
@@ -126,7 +148,7 @@ class AutoSyncJobService : JobService() {
                         }
                         
                         val uploadRequest = Request.Builder()
-                            .url("http://$ip:$port/api/v1/upload")
+                            .url("http://$targetIp:$targetPort/api/v1/upload")
                             .addHeader("X-Pairing-PIN", pin)
                             .addHeader("X-File-Name", Uri.encode(filename))
                             .post(requestBody)
